@@ -1,0 +1,42 @@
+# --- Core API ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+pydantic-settings>=2.2
+
+# --- Data / analytics ---
+# numpy pinned <2 for broad wheel + ecosystem compatibility on Win/py3.11
+numpy>=1.24,<2.0
+pandas>=2.0,<2.3
+
+# --- Broker (Moomoo / Futu OpenAPI) ---
+# Moomoo-branded SDK; the client falls back to `futu` if only that is present.
+moomoo-api>=9.0
+
+# --- Broker (Interactive Brokers via TWS / IB Gateway, read-only; optional) ---
+# Maintained successor to ib_insync. Only needed when IBKR_ENABLED=true.
+ib_async>=2.0
+
+# --- Broker (Tiger Brokers via Tiger Open API, read-only; optional) ---
+# Only needed when TIGER_ENABLED=true. Lazy-imported in tiger_client.py, so the
+# app runs fine without it installed. Resolves cleanly against the numpy<2.0 pin.
+tigeropen>=3.0
+
+# --- LLM providers (used from Phase 2 onward) ---
+anthropic>=0.40
+google-genai>=0.3
+
+# --- ML (optional; lazy-imported in app/ml/, app runs fine without these installed) ---
+# Trains offline via `python -m app.ml.train`; confirmed to resolve cleanly against
+# the numpy<2.0/pandas<2.3 pins above -- no version bump needed.
+scikit-learn>=1.4
+lightgbm>=4.0
+pyarrow>=14
+joblib>=1.3
+scipy>=1.11
+
+# --- Volatility modelling (options strategist GARCH forecast) ---
+# arch (Kevin Sheppard, NCSA license) resolves cleanly against the numpy<2.0
+# pin. Guarded import in options_math.py -> degrades to realized-vol comparison
+# if absent, so this stays effectively optional at runtime.
+arch>=6.0,<8.0

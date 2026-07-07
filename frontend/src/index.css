@@ -1,0 +1,107 @@
+:root,
+[data-theme='dark'] {
+  --bg: #0b0b0c;
+  --panel: #17181a;
+  --panel-2: #1d1e21;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --text: #f4f4f3;
+  --muted: #a6a6a3;
+  --muted-2: #706f6c;
+  --accent: #4c8dff;
+  --brand: #e8845c;
+  --brand-bg: rgba(232, 132, 92, 0.14);
+  --up: #34c77b;
+  --up-bg: rgba(52, 199, 123, 0.14);
+  --down: #f1594f;
+  --down-bg: rgba(241, 89, 79, 0.14);
+  --warn: #f4a945;
+  --warn-bg: rgba(244, 169, 69, 0.14);
+  --chart-ema-fast: #4c8dff;
+  --chart-ema-mid: #f4a945;
+  --chart-ema-slow: #b389e0;
+  color-scheme: dark;
+}
+
+[data-theme='light'] {
+  --bg: #faf9f5;
+  --panel: #ffffff;
+  --panel-2: #f3f1e9;
+  --border: rgba(30, 28, 20, 0.09);
+  --border-strong: rgba(30, 28, 20, 0.16);
+  --text: #211f1b;
+  --muted: #6b6a63;
+  --muted-2: #9b9a92;
+  --accent: #1c5fa8;
+  --brand: #a34620;
+  --brand-bg: #f4e3d8;
+  --up: #227a4e;
+  --up-bg: #e4f3ea;
+  --down: #b23a32;
+  --down-bg: #fbeae8;
+  --warn: #8a5a0f;
+  --warn-bg: #fbf0dc;
+  --chart-ema-fast: #1c5fa8;
+  --chart-ema-mid: #8a5a0f;
+  --chart-ema-slow: #7c4fa8;
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Segoe UI', Inter,
+    sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+body {
+  margin: 0;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  color: var(--text);
+  margin: 0;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 7px 14px;
+  border-radius: 7px;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+select,
+input {
+  font: inherit;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 10px;
+}
