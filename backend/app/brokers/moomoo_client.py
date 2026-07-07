@@ -12,6 +12,7 @@ Run the connectivity smoke test from the `backend/` directory:
 from __future__ import annotations
 
 import contextlib
+import time
 from datetime import date, timedelta
 
 import pandas as pd
@@ -234,6 +235,46 @@ class MoomooClient:
             group_name, [code], ModifyUserSecurityOp.ADD
         )
         self._check(ret, data, "modify_user_security")
+
+    # --- Level-2 order book --------------------------------------------
+    def get_market_depth(self, code: str, num: int = 10) -> dict | None:
+        """Level-2 order book snapshot, aggregated to bid/ask totals + imbalance.
+
+        Returns the SAME shape as IBKRClient.get_market_depth so the two are
+        interchangeable. Needs the market's L2 quote permission (the user has US
+        stocks/ETFs at full 10-level depth); returns None on no permission,
+        thin/one-sided book, or any failure — depth is bonus context, never a
+        hard dependency. Subscribe→read→unsubscribe so it doesn't hold an
+        order-book subscription slot beyond the call."""
+        from moomoo import SubType
+        ret, _msg = self.quote.subscribe([code], [SubType.ORDER_BOOK], is_first_push=False)
+        if ret != RET_OK:
+            return None  # e.g. "No permission to subscribe" for this market
+        try:
+            time.sleep(1.2)  # let the book push arrive
+            ret, ob = self.quote.get_order_book(code, num=num)
+            if ret != RET_OK or not isinstance(ob, dict):
+                return None
+            # each level is (price, volume, order_count, detail_dict)
+            bids = [(float(l[0]), float(l[1])) for l in ob.get("Bid", []) if len(l) >= 2 and l[1]]
+            asks = [(float(l[0]), float(l[1])) for l in ob.get("Ask", []) if len(l) >= 2 and l[1]]
+        finally:
+            with contextlib.suppress(Exception):
+                self.quote.unsubscribe([code], [SubType.ORDER_BOOK])
+        if not bids or not asks:
+            return None
+        bid_vol = sum(v for _, v in bids)
+        ask_vol = sum(v for _, v in asks)
+        total = bid_vol + ask_vol
+        best_bid, best_ask = bids[0][0], asks[0][0]
+        return {
+            "bid_levels": len(bids), "ask_levels": len(asks),
+            "bid_vol": round(bid_vol), "ask_vol": round(ask_vol),
+            # % of visible size resting on the bid: >50 = buy-side pressure
+            "imbalance_pct": round(bid_vol / total * 100.0, 1) if total else None,
+            "best_bid": best_bid, "best_ask": best_ask,
+            "spread_pct": round((best_ask - best_bid) / best_ask * 100.0, 3) if best_ask else None,
+        }
 
 
 def _smoke() -> None:

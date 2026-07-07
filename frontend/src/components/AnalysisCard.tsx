@@ -144,7 +144,7 @@ export function AnalysisCard({ ta, tf = 'day' }: { ta: TechnicalAnalysis; tf?: s
         {ta.order_book && ta.order_book.imbalance_pct != null && (
           <span
             className="chip"
-            title={`IBKR Level-2 depth (${ta.order_book.bid_levels}/${ta.order_book.ask_levels} levels): ${fmtNum(ta.order_book.bid_vol, 0)} bid vs ${fmtNum(ta.order_book.ask_vol, 0)} ask · spread ${ta.order_book.spread_pct ?? '—'}%`}
+            title={`Level-2 order book (${ta.order_book.bid_levels}/${ta.order_book.ask_levels} levels): ${fmtNum(ta.order_book.bid_vol, 0)} bid vs ${fmtNum(ta.order_book.ask_vol, 0)} ask · spread ${ta.order_book.spread_pct ?? '—'}%`}
           >
             📚 Book:{' '}
             <b

@@ -458,14 +458,27 @@ class AnalysisService:
         except Exception:  # noqa: BLE001
             holds = False
 
-        # IBKR Level-2 depth (needs a deep-book subscription + open market).
-        # Pure context — shown as a chip and fed to the LLM, never scored.
-        try:
+        # Level-2 depth (needs the market's L2 quote permission + open market).
+        # Pure context — shown as a chip and fed to the LLM, never scored. Tries
+        # Moomoo first (the user's US stock/ETF L2 lives there), then IBKR's deep
+        # book as a fallback. Same dict shape from either source.
+        def _depth():
+            if self._client is not None:
+                try:
+                    with self._lock:
+                        d = self._client.get_market_depth(ta.code)
+                    if d is not None:
+                        return d
+                except Exception:  # noqa: BLE001 - no L2 permission / closed market
+                    pass
             if self._ibkr is not None:
-                ta.order_book = self._cache.get_or_set(
-                    f"depth:{ta.code}", 30,
-                    lambda: self._ibkr.get_market_depth(ta.code),
-                )
+                try:
+                    return self._ibkr.get_market_depth(ta.code)
+                except Exception:  # noqa: BLE001
+                    return None
+            return None
+        try:
+            ta.order_book = self._cache.get_or_set(f"depth:{ta.code}", 30, _depth)
         except Exception:  # noqa: BLE001
             ta.order_book = None
 
