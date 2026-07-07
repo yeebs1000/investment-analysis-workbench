@@ -1,0 +1,34 @@
+# Python
+backend/.venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets & local config (never commit) — .env.example IS committed
+.env
+*.env
+!.env.example
+backend/.env
+# Broker private keys / certs
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime data (persisted snapshots, trained models, reports)
+backend/data_store/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local scratch handoff notes (session context, not for the public repo)
+handoff.md
