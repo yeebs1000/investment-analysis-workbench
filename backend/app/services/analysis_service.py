@@ -465,6 +465,10 @@ class AnalysisService:
         def _depth():
             if self._client is not None:
                 try:
+                    # ponytail: holds the broker lock through get_market_depth's
+                    # ~1.2s subscribe wait, blocking other Moomoo calls that long.
+                    # Fine today (single-symbol, 30s cache); move depth off the
+                    # shared lock if concurrent depth requests get common.
                     with self._lock:
                         d = self._client.get_market_depth(ta.code)
                     if d is not None:

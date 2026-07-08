@@ -150,8 +150,11 @@ def size_growth_tilt(fundamentals: dict | None, rel_strength_pct: float | None =
         tilt, size_class = 0.3, "small-cap"
         reasons.append(f"Small-cap (~${mcap/1000:.1f}B) — far more room to compound than a mega-cap.")
     else:
-        tilt, size_class = 0.25, "micro-cap"
-        reasons.append(f"Micro-cap (~${mcap:.0f}M) — high growth potential, but thinner and more volatile.")
+        # ponytail: micro >= small (not just close) so "smaller = more
+        # overweighted" holds all the way down; risk is reflected in the
+        # confidence/volatility lens elsewhere, not by capping this tilt.
+        tilt, size_class = 0.35, "micro-cap"
+        reasons.append(f"Micro-cap (~${mcap:.0f}M) — highest growth potential, but thinner and more volatile.")
 
     small_ish = mcap < MID_CAP_MUSD
     # 2. growth-stage boost -- small + high-growth is the strongest-overweight bucket
@@ -183,8 +186,7 @@ def size_growth_tilt(fundamentals: dict | None, rel_strength_pct: float | None =
         "tilt": round(tilt, 2),
         "label": label,
         "size_class": size_class,
-        # strong tilt scales the suggested position ~0.4x (mega) .. 1.6x (small grower)
-        "sizing_multiplier": round(1.0 + 0.6 * tilt, 2),
+        "sizing_multiplier": round(1.0 + 0.6 * tilt, 2),   # clamps to [0.4x, 1.6x]
         "reasons": reasons,
     }
 
