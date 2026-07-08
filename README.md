@@ -21,6 +21,26 @@ and the app works fully with zero AI key. It does not place trades, does not
 predict prices, and does not scrape news — it reads your actual positions and
 tells you what the numbers already say.
 
+## Why this is different
+
+- **Auditable, not a black box.** Every score, stop, target, and Greek traces to
+  Python you can read in one sitting — no vendor API, no opaque "AI says buy."
+- **True multi-broker, not a skin.** Moomoo, IBKR, and Tiger each have a real
+  fallback chain for bars, quotes, and options — link one, several, or none of
+  the account-linked brokers and the app degrades honestly instead of failing.
+- **ML that's allowed to say no.** The optional forecast trains with purged
+  walk-forward validation, a shuffled-label leak check, and a block-bootstrap
+  confidence interval — it only activates if it clears its own gate, and ships
+  at 0 score-weight otherwise. Most retail "AI trading" tools skip this and
+  ship whatever overfit backtest looked good.
+- **Real options math, not a vibe.** Black-Scholes Greeks, a GARCH forward-vol
+  forecast compared against implied, probability-of-profit and expected value
+  per structure — computed, not guessed.
+- **Free to run fully.** The deterministic engine needs zero API keys; AI
+  narration and macro/fundamentals context are opt-in extras, not the product.
+- **Read-only, always.** No order-placement code path exists anywhere in the
+  app — there's nothing to accidentally wire up.
+
 ## 👉 New here? Read [SETUP.md](SETUP.md)
 
 [SETUP.md](SETUP.md) is a step-by-step guide that assumes **zero technical background** —
