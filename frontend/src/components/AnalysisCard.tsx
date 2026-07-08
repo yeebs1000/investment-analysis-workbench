@@ -167,11 +167,33 @@ export function AnalysisCard({ ta, tf = 'day' }: { ta: TechnicalAnalysis; tf?: s
           </span>
         )}
         {ta.insider && ta.insider.direction !== 'neutral' && (
-          <span className="chip" title="Net insider buying/selling over the last ~6 months (Finnhub MSPR)">
+          <span
+            className="chip"
+            title={
+              ta.insider.open_market_buys != null
+                ? `Net insider buying/selling over the last ~6 months (Finnhub MSPR). ` +
+                  `Open-market Form-4 only (excludes gifts/tax-withholding/option-exercise): ` +
+                  `${ta.insider.open_market_buys} buys, ${ta.insider.open_market_sells} sells, ` +
+                  `net ${(ta.insider.net_notional_usd ?? 0) >= 0 ? '+' : ''}${fmtNum((ta.insider.net_notional_usd ?? 0) / 1e6, 1)}M` +
+                  (ta.insider.largest_trade
+                    ? ` — largest: ${ta.insider.largest_trade.name ?? 'unknown'} ${ta.insider.largest_trade.side} ${fmtNum(ta.insider.largest_trade.notional_usd / 1e6, 1)}M on ${ta.insider.largest_trade.date ?? '?'}`
+                    : '')
+                : 'Net insider buying/selling over the last ~6 months (Finnhub MSPR)'
+            }
+          >
             👤 Insiders:{' '}
             <b style={{ color: ta.insider.net_mspr >= 0 ? 'var(--up)' : 'var(--down)' }}>
               {ta.insider.direction}
             </b>
+          </span>
+        )}
+        {ta.short_interest && ta.short_interest.label !== 'Normal' && ta.short_interest.label !== 'Unknown' && (
+          <span
+            className="chip"
+            title={`Short-sale / borrow-availability read: ${ta.short_interest.reasons.join('; ')}`}
+          >
+            🩳 Short:{' '}
+            <b style={{ color: 'var(--down)' }}>{ta.short_interest.label}</b>
           </span>
         )}
         {ta.reward_risk != null && <span className="chip">Reward:Risk {fmtNum(ta.reward_risk)}:1</span>}

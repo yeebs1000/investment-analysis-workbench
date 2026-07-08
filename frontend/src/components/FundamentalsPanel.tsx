@@ -9,7 +9,7 @@ const FIELD_LABELS: Record<string, string> = {
   gross_margin_pct: 'Gross margin', net_margin_pct: 'Net margin', operating_margin_pct: 'Operating margin',
   revenue_growth_yoy_pct: 'Revenue growth YoY', eps_growth_5y_pct: 'EPS growth (5y)',
   debt_to_equity: 'Debt / equity', current_ratio: 'Current ratio', beta: 'Beta',
-  week52_high: '52w high', week52_low: '52w low',
+  week52_high: '52w high', week52_low: '52w low', dividend_yield_pct: 'Dividend yield',
 }
 
 export function FundamentalsPanel({ code }: { code: string }) {
@@ -72,6 +72,7 @@ export function FundamentalsPanel({ code }: { code: string }) {
             <Metric label="Debt / equity" value={fm.debt_to_equity} />
             <Metric label="Current ratio" value={fm.current_ratio} />
             <Metric label="Beta" value={fm.beta} />
+            <Metric label="Dividend yield" value={fm.dividend_yield_pct} suffix="%" />
           </div>
 
           {fm.missing_fields.length > 0 && (

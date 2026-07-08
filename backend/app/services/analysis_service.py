@@ -17,7 +17,7 @@ from app.analytics import fundamental_quality
 from app.analytics import indicators as ind
 from app.analytics import options as options_engine
 from app.analytics import performance
-from app.analytics import risk, scoring, technical
+from app.analytics import risk, scoring, short_interest as short_interest_engine, technical
 try:  # Moomoo SDK (moomoo-api/futu) is imported at moomoo_client top level, so
     # an IBKR/Tiger-only user who never installed it can still run the app.
     from app.brokers.moomoo_client import MoomooClient, MoomooError
@@ -400,6 +400,11 @@ class AnalysisService:
         ta = technical.analyze(code, str(resolved_name), bars, snapshot,
                                htf=htf, ppy=ppy, analyst=analyst, bench=bench,
                                ml_signal=ml_signal)
+        # Short-interest / borrow read: free -- reuses the snapshot dict already
+        # fetched above (Moomoo's raw columns, previously never read past
+        # name/52wk). No extra network call, so this runs on every analysis,
+        # including bulk portfolio/watchlist runs.
+        ta.short_interest = short_interest_engine.read(snapshot)
         # Event/positioning context (Finnhub, US-skewed): EPS-surprise/PEAD, net
         # insider buying, and fundamental quality. Attached for display + the LLM
         # report; deliberately NOT fed into the deterministic score (no lookahead-
@@ -416,7 +421,16 @@ class AnalysisService:
             except Exception:  # noqa: BLE001
                 ta.insider = None
             try:
-                raw_fund = finnhub_client.fundamentals(code)
+                # Discretionary open-market Form-4 detail merged onto the same
+                # aggregate-MSPR dict -- a sharper read than the aggregate alone
+                # (see finnhub_client.insider_transactions docstring).
+                txns = finnhub_client.insider_transactions(code)
+                if txns:
+                    ta.insider = {**(ta.insider or {}), **txns}
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                raw_fund = self._fundamentals_with_moomoo_fallback(code)
                 ta.fundamental_quality = fundamental_quality.score_quality(raw_fund)
                 # Size/growth-stage conviction tilt (current fundamentals + price
                 # relative strength as the "hot" proxy) -- underweight mega-caps,
@@ -740,13 +754,58 @@ class AnalysisService:
                                         finnhub_symbol=r["finnhub_symbol"], type=r["type"]))
         return results[:15]
 
+    def _fundamentals_with_moomoo_fallback(self, code: str) -> dict | None:
+        """finnhub_client.fundamentals() output, with pe/pb/market-cap/dividend
+        backfilled from the Moomoo snapshot when Finnhub has nothing for them --
+        Finnhub's free tier skews US-listed, so HK/SG/JP/CN names often come
+        back with these fields in `missing_fields` (or no data at all); Moomoo
+        carries them for every market it has quote permission for.
+
+        Market cap needs FX conversion: Moomoo returns it in the LISTING's
+        local currency, verified live (HK.00700's total_market_val is ~4.34e12,
+        matching Tencent's real HKD market cap, not a USD figure) -- pe/pb/
+        dividend-yield are ratios/percentages and are currency-invariant, no
+        conversion needed for those."""
+        code_u = code.strip().upper()
+        try:
+            raw = finnhub_client.fundamentals(code_u)
+        except Exception:  # noqa: BLE001
+            raw = None
+        try:
+            snap = self._snapshots([code_u]).get(code_u) or {}
+        except Exception:  # noqa: BLE001
+            snap = {}
+        if not snap:
+            return raw
+
+        ccy = normalize.MARKET_CURRENCY.get(normalize.market_of(code_u), "USD")
+        # snap is a raw pandas-row dict -- a missing numeric cell is NaN, not
+        # None, so every read here goes through normalize._f (NaN -> None).
+        mcap_local = normalize._f(snap.get("total_market_val"))
+        backfill = {
+            "pe_ttm": normalize._f(snap.get("pe_ttm_ratio")),
+            "pb": normalize._f(snap.get("pb_ratio")),
+            "market_cap_musd": (mcap_local * fx_to_usd(ccy) / 1_000_000.0) if mcap_local is not None else None,
+            "dividend_yield_pct": normalize._f(snap.get("dividend_ratio_ttm")),
+        }
+        raw = dict(raw) if raw else {"available_fields": [], "missing_fields": []}
+        for key, val in backfill.items():
+            if raw.get(key) is not None or val is None:
+                continue
+            raw[key] = round(val, 2)
+            missing = [k for k in raw.get("missing_fields") or [] if k != key]
+            raw["missing_fields"] = missing
+            avail = raw.get("available_fields") or []
+            raw["available_fields"] = avail if key in avail else [*avail, key]
+        return raw
+
     def get_fundamentals(self, code: str):
         from app.data.models import FundamentalMetrics
 
         def fetch() -> FundamentalMetrics:
             code_u = code.strip().upper()
             try:
-                data = finnhub_client.fundamentals(code_u)
+                data = self._fundamentals_with_moomoo_fallback(code_u)
             except Exception as exc:  # noqa: BLE001
                 return FundamentalMetrics(code=code_u, error=f"Fundamentals unavailable: {exc}")
             if data is None:

@@ -53,6 +53,7 @@ def _symbol_payload(ta: TechnicalAnalysis) -> dict:
         "insider_sentiment": ta.insider,
         "fundamental_quality": ta.fundamental_quality,
         "size_growth_tilt": ta.growth_tilt,
+        "short_interest": ta.short_interest,
         "entry_risk": ta.entry_risk,
         "verdict_two_axis": ta.verdict,
         "next_earnings": ta.next_earnings,

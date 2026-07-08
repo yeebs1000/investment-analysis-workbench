@@ -109,6 +109,7 @@ class TechnicalAnalysis(BaseModel):
     analyst_consensus: dict | None = None     # Finnhub analyst rating distribution
     earnings_surprise: dict | None = None     # recent EPS beats/misses + PEAD read (context, not scored)
     insider: dict | None = None               # net insider buying/selling (context, not scored)
+    short_interest: dict | None = None        # borrow availability / short-sell rate (context, not scored)
     fundamental_quality: dict | None = None   # Buffett/Munger quality score, SEPARATE from technical score
     growth_tilt: dict | None = None           # size/growth-stage conviction tilt (underweight mega, overweight small growers)
     entry_risk: dict | None = None            # categorical chase/capitulation flag; None = normal behaviour
@@ -247,6 +248,7 @@ class FundamentalMetrics(BaseModel):
     beta: float | None = None
     week52_high: float | None = None
     week52_low: float | None = None
+    dividend_yield_pct: float | None = None
     available_fields: list[str] = Field(default_factory=list)
     missing_fields: list[str] = Field(default_factory=list)
     error: str | None = None

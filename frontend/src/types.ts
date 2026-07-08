@@ -48,6 +48,7 @@ export interface TechnicalAnalysis {
   insider: InsiderSentiment | null
   fundamental_quality: FundamentalQuality | null
   growth_tilt: GrowthTilt | null
+  short_interest: ShortInterest | null
   entry_risk: EntryRisk | null
   verdict: TwoAxisVerdict | null
   next_earnings: NextEarnings | null
@@ -108,6 +109,27 @@ export interface InsiderSentiment {
   net_change: number
   months: number
   direction: string
+  // discretionary open-market Form-4 detail (merged onto the aggregate above)
+  open_market_buys?: number
+  open_market_sells?: number
+  net_notional_usd?: number
+  largest_trade?: {
+    name: string | null
+    side: 'buy' | 'sell'
+    shares: number
+    price: number
+    notional_usd: number
+    date: string | null
+  } | null
+  window_days?: number
+}
+
+export interface ShortInterest {
+  shortable: boolean | null
+  short_sell_rate_pct: number | null
+  available_shares: number | null
+  label: string
+  reasons: string[]
 }
 
 export interface FundamentalQuality {
@@ -334,6 +356,7 @@ export interface FundamentalMetrics {
   beta: number | null
   week52_high: number | null
   week52_low: number | null
+  dividend_yield_pct: number | null
   available_fields: string[]
   missing_fields: string[]
   error: string | null

@@ -1,8 +1,9 @@
 """Finnhub data provider (read-only): company/symbol search, analyst
 recommendation consensus, and basic fundamentals. The free tier covers
 search, quotes, recommendation trends, and `stock/metric` fundamentals;
-price targets are premium (403) so we use the analyst rating distribution as
-the institutional-conviction signal instead.
+price targets AND upgrade/downgrade events are premium (403, verified live)
+so we use the analyst rating distribution as the institutional-conviction
+signal instead.
 
 All calls are short-cached. Network/HTTP errors degrade to None so the core
 (Moomoo-driven) analysis never depends on this. Coverage skews heavily to
@@ -248,6 +249,71 @@ def insider_sentiment(code: str) -> dict | None:
         "net_change": int(net_change),
         "months": len(rows),
         "direction": direction,
+    }
+
+
+# SEC Form 4 transaction codes that are genuine, discretionary open-market
+# trades. Excludes 'G' (gift), 'F' (tax withholding), 'M' (option exercise),
+# 'A' (grant/award) -- those are administrative, not a signal, and counting
+# them as bullish/bearish (a common mistake) would misread routine paperwork
+# as conviction.
+_DISCRETIONARY_CODES = {"P": "buy", "S": "sell"}
+
+
+def insider_transactions(code: str, days: int = 180) -> dict | None:
+    """Individual insider Form 4 filings, filtered to genuine open-market buys
+    /sells (see _DISCRETIONARY_CODES) -- a sharper signal than the aggregated
+    MSPR from insider_sentiment(), which can't distinguish a discretionary buy
+    from routine option-exercise/tax-withholding activity. Returns
+    {open_market_buys, open_market_sells, net_notional_usd, largest_trade,
+    window_days} or None if unavailable."""
+    fh = moomoo_to_finnhub(code)
+    if not fh:
+        return None
+    import datetime as _dt
+    today = _dt.date.today()
+    data = _get("stock/insider-transactions", {
+        "symbol": fh,
+        "from": (today - _dt.timedelta(days=days)).isoformat(),
+        "to": today.isoformat(),
+    })
+    rows = data.get("data") if isinstance(data, dict) else None
+    if not rows:
+        return None
+
+    buys = sells = 0
+    net_notional = 0.0
+    largest: dict | None = None
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        code_txn = r.get("transactionCode")
+        side = _DISCRETIONARY_CODES.get(code_txn)
+        if side is None:
+            continue
+        shares = r.get("share")
+        price = r.get("transactionPrice")
+        if not isinstance(shares, (int, float)):
+            continue
+        notional = abs(float(shares)) * float(price) if isinstance(price, (int, float)) and price else None
+        if side == "buy":
+            buys += 1
+            net_notional += notional or 0.0
+        else:
+            sells += 1
+            net_notional -= notional or 0.0
+        if notional is not None and (largest is None or notional > largest["notional_usd"]):
+            largest = {
+                "name": r.get("name"), "side": side, "shares": abs(float(shares)),
+                "price": float(price), "notional_usd": round(notional, 0),
+                "date": r.get("transactionDate"),
+            }
+    if buys == 0 and sells == 0:
+        return None
+    return {
+        "open_market_buys": buys, "open_market_sells": sells,
+        "net_notional_usd": round(net_notional, 0),
+        "largest_trade": largest, "window_days": days,
     }
 
 
