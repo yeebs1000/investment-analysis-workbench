@@ -28,6 +28,40 @@ FILE_MAX = 600       # cap for a file-based universe (enough for the full S&P 50
 # Bundled broad-universe file shipped with the repo.
 SP500_FILE = Path(__file__).with_name("universe_sp500.txt")
 
+# Yahoo-style exchange codes (financedatabase inherits these) for the major
+# tradable US venues -- excludes OTC/pink-sheet (PNK) and foreign cross-listings.
+_US_EXCHANGES = ("NMS", "NYQ", "ASE", "NGM", "NCM")
+
+
+def smallcap_universe(max_symbols: int | None = None, per_sector: int = 55) -> list[str]:
+    """Sector-stratified sample of small/micro-cap US equities, from the
+    `financedatabase` package's bundled local snapshot -- no API key, no rate
+    limit, since it's a static dataset shipped in the pip package (its
+    `market_cap` bucket is therefore a snapshot label, not live).
+
+    The bundled sp500 universe is large/mega-cap by construction (that's what
+    makes it the S&P 500), so it can't test whether the small-cap/hot-sector
+    growth tilt (fundamental_quality.size_growth_tilt) actually holds up
+    out-of-sample -- this gives the ML training universe real small-cap
+    breadth, capped per sector so no single sector (Financials is ~40% of the
+    raw pool) dominates the sample.
+    """
+    import financedatabase as fd  # ponytail: lazy import, ML-only optional dep
+
+    df = fd.Equities().select(country="United States")
+    df = df[
+        df["exchange"].isin(_US_EXCHANGES)
+        & (df["delisted"] == False)  # noqa: E712
+        & df["market_cap"].isin(("Small Cap", "Micro Cap"))
+    ]
+    codes: list[str] = []
+    seen: set[str] = set()
+    for _, grp in df.groupby("sector"):
+        for ticker in grp.index[:per_sector]:
+            if ticker.isalnum():  # skip preferred/unit tickers like "AAIC^C"
+                _dedup_add(codes, seen, f"US.{ticker}")
+    return codes[: max_symbols or FILE_MAX]
+
 
 def _dedup_add(codes: list[str], seen: set[str], code: str) -> None:
     # option contracts (e.g. US.IREN260702C44000) are excluded: the training
@@ -53,8 +87,13 @@ def resolve_universe(svc=None, source: str = "holdings", max_symbols: int | None
     """Return the training universe + the benchmark.
 
     source="holdings" -> account positions + watchlists (default).
-    source=<path> or "sp500" -> read codes from that file (broad list)."""
-    if source and source != "holdings":
+    source="sp500" -> the bundled broad-list file.
+    source="smallcap" -> sector-stratified small/micro-cap sample (financedatabase).
+    source=<path> -> read codes from that file."""
+    if source == "smallcap":
+        codes = smallcap_universe(max_symbols=max_symbols)
+        cap = max_symbols or FILE_MAX
+    elif source and source != "holdings":
         path = SP500_FILE if source == "sp500" else Path(source)
         if not path.exists():
             raise FileNotFoundError(f"universe file not found: {path}")
@@ -85,3 +124,18 @@ def resolve_universe(svc=None, source: str = "holdings", max_symbols: int | None
 
 # Back-compat for any caller importing the old constant name.
 UNIVERSE_MAX = HOLDINGS_MAX
+
+
+def demo() -> None:
+    """Manual check, not run by CI: `financedatabase` fetches its dataset over
+    the network on first use (nothing meaningful is bundled in the pip
+    package), unlike every other test in this suite. Run directly:
+    `python -m app.ml.universe`."""
+    codes = smallcap_universe()
+    assert 0 < len(codes) <= FILE_MAX, len(codes)
+    assert all(c.startswith("US.") for c in codes)
+    print(f"smallcap_universe: {len(codes)} symbols, e.g. {codes[:5]}")
+
+
+if __name__ == "__main__":
+    demo()

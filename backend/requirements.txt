@@ -40,3 +40,8 @@ scipy>=1.11
 # pin. Guarded import in options_math.py -> degrades to realized-vol comparison
 # if absent, so this stays effectively optional at runtime.
 arch>=6.0,<8.0
+
+# --- ML training universe (optional; lazy-imported in app/ml/universe.py) ---
+# Static local sector/industry/market-cap classification data (no API key, no
+# rate limit) used only for `--universe smallcap` training runs.
+financedatabase>=2.0

@@ -58,7 +58,9 @@ def main() -> None:
     ap.add_argument("--universe", default="holdings",
                     help="training universe: 'holdings' (your positions + watchlists, default), "
                          "'sp500' (the bundled S&P 500 list -- broad, fixes survivorship/sample "
-                         "size but a long broker fetch), or a path to your own file of "
+                         "size but a long broker fetch), 'smallcap' (sector-stratified small/"
+                         "micro-cap sample via financedatabase -- tests the small-cap/hot-sector "
+                         "growth tilt out-of-sample), or a path to your own file of "
                          "MARKET.SYMBOL codes (one per line).")
     ap.add_argument("--recal-sample-cap", type=int, default=RECAL_SAMPLE_CAP_DEFAULT)
     ap.add_argument("--lookback-days", type=int, default=1095,
