@@ -20,8 +20,26 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('portfolio')
   const [health, setHealth] = useState<Health | null>(null)
 
+  // Retry health on cold start: if the frontend loads before the backend is
+  // ready (or during a restart), a single failed fetch would leave the header
+  // brokerless forever. Retry a few times, then refresh occasionally so
+  // connectivity (e.g. a gateway coming up) stays current.
   useEffect(() => {
-    api.health().then(setHealth).catch(() => setHealth(null))
+    let cancelled = false
+    const load = (attempt = 0) => {
+      api
+        .health()
+        .then((h) => !cancelled && setHealth(h))
+        .catch(() => {
+          if (!cancelled && attempt < 5) setTimeout(() => load(attempt + 1), 2000)
+        })
+    }
+    load()
+    const iv = setInterval(() => load(), 30000)
+    return () => {
+      cancelled = true
+      clearInterval(iv)
+    }
   }, [])
 
   return (

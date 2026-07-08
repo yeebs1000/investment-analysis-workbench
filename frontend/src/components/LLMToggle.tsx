@@ -16,8 +16,18 @@ export function LLMToggle() {
     api.llmStatus().then(setStatus).catch(() => setStatus(null))
   }, [])
 
-  const disabled = (id: Provider) =>
-    id !== 'none' && status ? !status.available[id] : false
+  // If the selected provider isn't actually available (e.g. Claude with no API
+  // key), fall back to Gemini (if keyed) or Deterministic. Covers the load race
+  // where a provider was picked before status arrived.
+  useEffect(() => {
+    if (status && provider !== 'none' && !status.available[provider]) {
+      setProvider(status.available.gemini ? 'gemini' : 'none')
+    }
+  }, [status, provider, setProvider])
+
+  // Lock non-free providers until status confirms a key exists (unknown = locked,
+  // so nothing is clickable before we know it's usable).
+  const disabled = (id: Provider) => id !== 'none' && (!status || !status.available[id])
 
   return (
     <div className="llm-toggle" title="Toggle the AI that explains the analysis (controls API cost).">
