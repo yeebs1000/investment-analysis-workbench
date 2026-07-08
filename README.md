@@ -91,13 +91,13 @@ a Tiger-only setup, that's the first place to check.
 | Technical score / charts / decisions | ✅ | ✅ (fallback for US/HK/JP/China-Connect/SG; other markets may still fail to chart) | ✅ *(new; not live-tested)* |
 | Options strategist (chain, Greeks, IV, structures) | ✅ | ✅ *(new — needs an options market-data subscription for live quotes; degrades to Greeks-only, no fabricated prices, if you only have delayed/no options data)* | ✅ *(new; not live-tested)* |
 | Live quote freshness (display name + 52wk-high/low flavor text only — price/score always come from bars, on every broker) | ✅ | ✅ *(new)* | ✅ *(new; not live-tested)* |
-| Level-2 order book depth chip | ❌ not implemented | ✅ only source (needs a paid market-data subscription) | ❌ not implemented |
+| Level-2 order book depth chip | ✅ full 10-level depth on US stocks/ETFs, no paid subscription needed; top-of-book only on some other markets | ✅ fallback (needs a paid deep-book subscription) | ❌ not implemented |
 | Watchlists (view / analyze / add / remove) | ✅ native groups + app-local lists | ✅ app-local lists (broker-independent) | ✅ app-local lists (broker-independent) |
 | Fundamentals, analyst consensus, earnings, insider, macro regime, AI narration | ✅ | ✅ (Finnhub/FRED/Gemini/Claude — broker-independent) | ✅ |
 
-The one broker-specific feature that stays exclusive is the **Level-2 depth
-chip**, which needs IBKR's own paid deep-book market-data subscription — no
-other broker's API in this app exposes that.
+The **Level-2 depth chip** tries Moomoo first (full 10-level book on US
+stocks/ETFs, included free) and falls back to IBKR's deep book (needs a paid
+subscription there) — so most users get it with no extra cost.
 
 ## Quick start (see [SETUP.md](SETUP.md) for the full walkthrough)
 
