@@ -359,7 +359,7 @@ def format_report(trades: list[Trade], meta: dict) -> str:
 
 def _manage_table(stats: dict[str, StratStats]) -> list[str]:
     lines = [
-        f"{'Strategy':<26}{'n':>5}{'hold P&L':>10}{'mgd P&L':>10}{'Δ':>8}"
+        f"{'Strategy':<26}{'n':>5}{'hold P&L':>10}{'mgd P&L':>10}{'chg':>8}"
         f"{'mgd win%':>10}{'~days':>7}",
         "-" * 78,
     ]
@@ -544,6 +544,12 @@ def main() -> None:
     ap.add_argument("--ab", action="store_true",
                     help="run gate ON and OFF from one fetch and print an A/B delta")
     args = ap.parse_args()
+    # Windows consoles default to cp1252, which can't encode non-ASCII; force
+    # UTF-8 so the report (and any stray unicode) never crashes the final print.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
 
     if args.symbols:
         symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
