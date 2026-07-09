@@ -85,6 +85,18 @@ def test_bsm_greeks_atm_call_delta_near_half():
     assert _approx(call["delta"] - put["delta"], 1.0, tol=1e-6)
 
 
+def test_bsm_price_path_vectorized_and_expiry():
+    spots = np.array([100.0, 105.0, 110.0, 108.0])
+    dtes = np.array([30, 20, 10, 0])   # last = expiry -> intrinsic
+    px = om.bsm_price_path(spots, 100.0, 25.0, dtes, "Call")
+    assert px.shape == (4,)
+    # element-wise agreement with the scalar pricer for the live entries
+    for i in range(3):
+        assert _approx(px[i], om.bsm_price(spots[i], 100.0, 25.0, int(dtes[i]), "Call"), tol=1e-6)
+    # at expiry -> intrinsic (108 call @100 = 8)
+    assert _approx(px[3], 8.0, tol=1e-9)
+
+
 def test_bsm_price_put_call_parity():
     # C - P = S - K*e^(-rT) must hold for any European BSM price pair.
     s, k, iv, dte, r = 100.0, 105.0, 30.0, 45, 0.04

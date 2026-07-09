@@ -96,6 +96,59 @@ def test_regime_map_and_plumbing():
     assert "regime only" in txt
 
 
+def test_managed_terminal_matches_payoff():
+    # With no rule triggered, the path's LAST mark must equal payoff_at_expiry --
+    # proves the daily BSM repricing is consistent with the terminal intrinsic.
+    from app.data.models import OptionLeg, OptionStrategy
+    legs = [
+        OptionLeg(action="Buy", right="Call", strike=100, expiry="x", price=3.0, iv_pct=25.0),
+        OptionLeg(action="Sell", right="Call", strike=110, expiry="x", price=1.0, iv_pct=25.0),
+    ]
+    s = OptionStrategy(name="Call Debit Spread", direction="Bullish", legs=legs,
+                       net_debit_credit=-2.0, max_loss=2.0, max_profit=8.0)
+    horizon = 20
+    # flat path ending exactly at entry spot -> known terminal payoff
+    path = np.full(horizon, 100.0)
+    m_pnl, reason, held = bt.managed_exit(s, 100.0, path, horizon)
+    term = float(om.payoff_at_expiry(legs, np.array([100.0]))[0])
+    assert reason == "expiry" and held == horizon
+    assert abs(m_pnl - term) < 1e-6, (m_pnl, term)
+
+
+def test_managed_profit_target_triggers_on_credit():
+    # a credit spread whose underlying rockets away from the short strike will hit
+    # the 70%-of-credit target well before expiry -> early exit.
+    from app.data.models import OptionLeg, OptionStrategy
+    legs = [
+        OptionLeg(action="Sell", right="Put", strike=95, expiry="x", price=2.5, iv_pct=30.0),
+        OptionLeg(action="Buy", right="Put", strike=90, expiry="x", price=1.0, iv_pct=30.0),
+    ]
+    s = OptionStrategy(name="Bull Put Spread (credit)", direction="Bullish", legs=legs,
+                       net_debit_credit=1.5, max_profit=1.5, max_loss=3.5)
+    horizon = 30
+    path = np.linspace(101, 120, horizon)   # rallies hard -> puts decay fast
+    m_pnl, reason, held = bt.managed_exit(s, 100.0, path, horizon)
+    assert reason == "profit_target", (reason, m_pnl, held)
+    assert held < horizon and m_pnl > 0
+
+
+def test_managed_be_stop_protects_a_faded_winner():
+    # debit spread that spikes (arms the BE stop) then fully reverses -> exits ~0
+    # instead of riding to a loss.
+    from app.data.models import OptionLeg, OptionStrategy
+    legs = [
+        OptionLeg(action="Buy", right="Call", strike=100, expiry="x", price=3.0, iv_pct=30.0),
+        OptionLeg(action="Sell", right="Call", strike=110, expiry="x", price=1.0, iv_pct=30.0),
+    ]
+    s = OptionStrategy(name="Call Debit Spread", direction="Bullish", legs=legs,
+                       net_debit_credit=-2.0, max_profit=8.0, max_loss=2.0)
+    horizon = 30
+    path = np.concatenate([np.linspace(100, 112, 15), np.linspace(112, 99, 15)])
+    m_pnl, reason, held = bt.managed_exit(s, 100.0, path, horizon)
+    assert reason == "stop_be", (reason, m_pnl, held)
+    assert abs(m_pnl) < 1e-9
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     passed = 0

@@ -55,6 +55,69 @@ DEFAULT_STEP = 10           # enter a new trade every N trading days (roll caden
 MIN_TRAIL_BARS = 260        # need >= this trailing history (GARCH wants ~250)
 
 
+@dataclass(frozen=True)
+class ManageRule:
+    """A per-structure exit rule for the early-management overlay. `profit_target`
+    closes when unrealized P&L reaches that fraction of max profit; `stop_to_be`
+    arms a breakeven stop once P&L reaches that fraction (never let a decent
+    winner round-trip to a loss). None/None = hold to expiry."""
+    profit_target: float | None = None
+    stop_to_be: float | None = None
+    label: str = "hold to expiry"
+
+
+# Not one-size-fits-all (the user's point): premium SELLERS decay reliably and
+# carry short-gamma tail risk into expiry, so take profit early; premium BUYERS
+# need the move to keep going, so ride but protect gains with a breakeven stop.
+# These thresholds are HYPOTHESES the backtest tests, not received wisdom.
+_CREDIT_RULE = ManageRule(profit_target=0.70, stop_to_be=None, label="take 70% of max credit")
+_DEBIT_RULE = ManageRule(profit_target=0.85, stop_to_be=0.50, label="ride; BE-stop once +50%")
+MANAGEMENT: dict[str, ManageRule] = {
+    "Bull Put Spread (credit)": _CREDIT_RULE,
+    "Bear Call Spread (credit)": _CREDIT_RULE,
+    "Iron Condor": _CREDIT_RULE,
+    "Cash-Secured Put": _CREDIT_RULE,
+    "Covered Call": _CREDIT_RULE,
+    "Call Debit Spread": _DEBIT_RULE,
+    "Put Debit Spread": _DEBIT_RULE,
+    "Long Straddle": ManageRule(profit_target=1.0, stop_to_be=0.5, label="ride; BE-stop once +50%"),
+    "Collar": ManageRule(label="hold (protective)"),   # a hedge, not a P&L trade
+}
+DEFAULT_RULE = ManageRule()
+
+
+def managed_exit(strategy, entry_spot: float, path_spots: np.ndarray, horizon: int):
+    """Walk the realized daily close path (entry+1 .. expiry) repricing the
+    position at constant entry IV -- spot moves (real) and theta decay drive the
+    mark; IV drift isn't modeled (conservative for sellers, who'd also bank vol
+    crush). Returns (pnl_per_share, exit_reason, days_held) applying the
+    per-structure ManageRule. With no rule triggered it equals hold-to-expiry."""
+    rule = MANAGEMENT.get(strategy.name, DEFAULT_RULE)
+    dtes = horizon - np.arange(1, len(path_spots) + 1)   # remaining trading-day tenor
+    pnl_path = np.zeros(len(path_spots))
+    for leg in strategy.legs:
+        p0 = leg.price or 0.0
+        prices = options_math.bsm_price_path(path_spots, leg.strike, leg.iv_pct or 0.0, dtes, leg.right)
+        pnl_path += (prices - p0) if leg.action == "Buy" else (p0 - prices)
+
+    base = strategy.max_profit
+    if base is None and (strategy.net_debit_credit or 0) > 0:
+        base = strategy.net_debit_credit          # credit structures: max profit = credit
+    if rule.profit_target is None and rule.stop_to_be is None or not base or base <= 0:
+        return float(pnl_path[-1]), "expiry", len(path_spots)
+
+    armed = False
+    for k, pnl in enumerate(pnl_path, start=1):
+        if rule.profit_target is not None and pnl >= rule.profit_target * base:
+            return float(pnl), "profit_target", k
+        if rule.stop_to_be is not None:
+            if pnl >= rule.stop_to_be * base:
+                armed = True
+            elif armed and pnl <= 0.0:
+                return 0.0, "stop_be", k          # exit ~breakeven, protecting the prior gain
+    return float(pnl_path[-1]), "expiry", len(path_spots)
+
+
 def synth_chain(spot: float, iv_pct: float, dte: int) -> pd.DataFrame:
     """A Black-Scholes-priced option chain in the exact schema
     options.build_analysis consumes (right/strike/delta/iv/price/bid/ask/oi/
@@ -98,6 +161,9 @@ class Trade:
     pnl_per_share: float
     win: bool
     regime: str | None = None   # market regime at entry ("bull"/"bear"/None)
+    managed_pnl: float | None = None    # P&L under the early-management overlay
+    exit_reason: str | None = None      # profit_target | stop_be | expiry
+    days_held: int | None = None
 
 
 @dataclass
@@ -107,6 +173,10 @@ class StratStats:
     pnl_sum: float = 0.0
     pop_sum: float = 0.0
     pop_n: int = 0
+    m_wins: int = 0            # managed-overlay wins
+    m_pnl_sum: float = 0.0     # managed-overlay P&L
+    held_sum: int = 0          # trading days held under management
+    early_closes: int = 0      # trades exited before expiry by the overlay
 
     def add(self, t: Trade) -> None:
         self.n += 1
@@ -115,6 +185,11 @@ class StratStats:
         if t.pop_pct is not None:
             self.pop_sum += t.pop_pct
             self.pop_n += 1
+        if t.managed_pnl is not None:
+            self.m_pnl_sum += t.managed_pnl
+            self.m_wins += 1 if t.managed_pnl > 0 else 0
+            self.held_sum += t.days_held or 0
+            self.early_closes += 1 if t.exit_reason in ("profit_target", "stop_be") else 0
 
     @property
     def win_rate(self) -> float | None:
@@ -127,6 +202,18 @@ class StratStats:
     @property
     def predicted_pop(self) -> float | None:
         return round(self.pop_sum / self.pop_n, 1) if self.pop_n else None
+
+    @property
+    def m_win_rate(self) -> float | None:
+        return round(100.0 * self.m_wins / self.n, 1) if self.n else None
+
+    @property
+    def m_avg_pnl(self) -> float | None:
+        return round(self.m_pnl_sum / self.n, 3) if self.n else None
+
+    @property
+    def avg_days_held(self) -> float | None:
+        return round(self.held_sum / self.n, 1) if self.n else None
 
 
 def regime_map_from_bench(bench_bars: pd.DataFrame | None) -> dict:
@@ -185,15 +272,18 @@ def backtest_symbol(
             market_regime=regime,
         )
         exit_spot = float(closes[i + horizon])
+        path_spots = closes[i + 1 : i + horizon + 1]   # realized daily closes, entry+1..expiry
         for s in result.strategies:
             if any(leg.price is None for leg in s.legs):
                 continue
             pnl = float(options_math.payoff_at_expiry(s.legs, np.array([exit_spot]))[0])
+            m_pnl, reason, held = managed_exit(s, spot, path_spots, horizon)
             trades.append(Trade(
                 date=str(idx[i].date()), symbol=code, strategy=s.name, direction=s.direction,
                 decision=ta.decision.value, pop_pct=s.pop_pct, ev_per_share=s.ev_per_share,
                 entry_spot=round(spot, 2), exit_spot=round(exit_spot, 2),
                 pnl_per_share=round(pnl, 3), win=pnl > 0, regime=regime,
+                managed_pnl=round(m_pnl, 3), exit_reason=reason, days_held=held,
             ))
         i += step
     return trades
@@ -252,15 +342,39 @@ def format_report(trades: list[Trade], meta: dict) -> str:
         span = f"{min(t.date for t in sub)} .. {max(t.date for t in sub)}"
         lines += ["", f"--- {regime.upper()} regime only ({len(sub)} trades, {span}) " + "-" * 20]
         lines += _table(aggregate(sub))
+    if any(t.managed_pnl is not None for t in trades):
+        lines += ["", "--- EARLY MANAGEMENT: hold-to-expiry vs managed exit " + "-" * 26]
+        lines += _manage_table(aggregate(trades))
     lines += [
         "-" * 78,
         "win% = fraction of entries with P&L > 0 at expiry on the REAL price path.",
         "pred POP = strategist's mean predicted probability of profit at entry.",
+        "managed = per-structure early exit (credit: take 70%; debit: ride + BE-stop).",
         "Caveat: entry premiums are MODELED (no historical chains exist), so this",
         "validates structure/strike/POP calibration, NOT the real IV-timing edge.",
         "=" * 78,
     ]
     return "\n".join(lines)
+
+
+def _manage_table(stats: dict[str, StratStats]) -> list[str]:
+    lines = [
+        f"{'Strategy':<26}{'n':>5}{'hold P&L':>10}{'mgd P&L':>10}{'Δ':>8}"
+        f"{'mgd win%':>10}{'~days':>7}",
+        "-" * 78,
+    ]
+    order = sorted((k for k in stats if k != "__ALL__"), key=lambda k: stats[k].n, reverse=True)
+    for k in order + ["__ALL__"]:
+        s = stats[k]
+        if not s.n or s.m_avg_pnl is None:
+            continue
+        label = "ALL" if k == "__ALL__" else k
+        delta = s.m_avg_pnl - s.avg_pnl
+        lines.append(
+            f"{label[:26]:<26}{s.n:>5}{s.avg_pnl:>10.3f}{s.m_avg_pnl:>10.3f}{delta:>+8.3f}"
+            f"{s.m_win_rate:>9.1f}%{s.avg_days_held:>7.1f}"
+        )
+    return lines
 
 
 IBKR_PACING_S = 10.0   # IB allows ~60 historical requests / 10 min -> 1 per 10s

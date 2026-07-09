@@ -172,6 +172,33 @@ def bsm_price(
     return float(max(px, 0.0))
 
 
+def bsm_price_path(spot, strike: float, iv_pct: float, dte, right: str, rate: float = 0.0):
+    """Vectorized BSM price over parallel spot/dte arrays -- reprices one leg
+    along a realized price path for the early-management backtest. Where dte<=0
+    (expiry) the price collapses to intrinsic, so the path's last point equals
+    payoff_at_expiry's premium-free intrinsic (verified in tests)."""
+    spot = np.asarray(spot, dtype=float)
+    dte = np.asarray(dte, dtype=float)
+    is_call = right.upper() == "CALL"
+    intrinsic = np.maximum(spot - strike, 0.0) if is_call else np.maximum(strike - spot, 0.0)
+    out = intrinsic.copy()
+    live = (dte > 0) & (spot > 0) & (iv_pct is not None and iv_pct > 0)
+    if np.any(live):
+        sigma = iv_pct / 100.0
+        t = dte[live] / 365.0
+        sqrt_t = np.sqrt(t)
+        s = spot[live]
+        d1 = (np.log(s / strike) + (rate + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t)
+        d2 = d1 - sigma * sqrt_t
+        disc = np.exp(-rate * t)
+        if is_call:
+            px = s * norm.cdf(d1) - strike * disc * norm.cdf(d2)
+        else:
+            px = strike * disc * norm.cdf(-d2) - s * norm.cdf(-d1)
+        out[live] = np.maximum(px, 0.0)
+    return out
+
+
 def default_price_grid(spot: float, pct: float = 0.4, n: int = 200) -> np.ndarray:
     """A dense price grid spanning spot +/- pct, for payoff/POP evaluation."""
     lo = max(spot * (1.0 - pct), 0.01)
