@@ -7,7 +7,27 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from scipy.special import ndtr as _ndtr   # normal CDF without scipy.stats' per-call wrapper overhead
+
+_INV_SQRT_2PI = 1.0 / np.sqrt(2.0 * np.pi)
+
+
+class _FastNorm:
+    """Drop-in for scipy.stats.norm's cdf/pdf, ~10-50x faster per call: ndtr is
+    the bare normal CDF (what norm.cdf wraps in argsreduce/broadcast machinery),
+    and the pdf is the closed form. Works on scalars and arrays. This math is on
+    the backtest's hot path (millions of BSM evals) -- it dominated the profile."""
+    @staticmethod
+    def cdf(x):
+        return _ndtr(x)
+
+    @staticmethod
+    def pdf(x):
+        x = np.asarray(x, dtype=float)
+        return np.exp(-0.5 * x * x) * _INV_SQRT_2PI
+
+
+norm = _FastNorm()
 
 PERIODS_PER_YEAR = 252.0
 

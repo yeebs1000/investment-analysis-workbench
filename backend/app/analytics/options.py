@@ -150,6 +150,7 @@ def build_analysis(
     next_atm_iv_pct: float | None = None,
     next_expiry: str | None = None,
     market_regime: str | None = None,   # "bull" | "bear" | None=unknown (see benchmark_regime)
+    forecast_vol_pct: float | None = None,   # precomputed GARCH forecast; skip the (costly) refit if given
 ) -> OptionsAnalysis:
     out = OptionsAnalysis(
         code=code, name=name, as_of=as_of, spot=spot,
@@ -188,7 +189,13 @@ def build_analysis(
     # statistically correct baseline: implied vol prices variance over the
     # contract's life, so 'rich/cheap' should be IV vs forward vol for that
     # horizon, not vs what already happened. Falls back to realized on any miss.
-    fv = options_math.forecast_vol_garch(bars, dte)
+    # A caller mid-backtest can pass a precomputed forecast (the GARCH fit barely
+    # moves over a few days but is the per-entry bottleneck) -- refit only when
+    # not supplied. A non-positive value means "known no-forecast, don't refit".
+    if forecast_vol_pct is not None:
+        fv = forecast_vol_pct if forecast_vol_pct > 0 else None
+    else:
+        fv = options_math.forecast_vol_garch(bars, dte)
     out.forecast_vol_pct = round(fv, 1) if fv else None
     baseline = fv if (fv and fv > 0) else rv
     out.iv_regime_basis = "garch_forecast" if (fv and fv > 0) else "realized"

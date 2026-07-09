@@ -53,6 +53,7 @@ DEFAULT_VRP = 0.05          # implied trades ~5% over realized on average (vol r
 DEFAULT_HORIZON = 35        # tenor in trading days
 DEFAULT_STEP = 10           # enter a new trade every N trading days (roll cadence)
 MIN_TRAIL_BARS = 260        # need >= this trailing history (GARCH wants ~250)
+GARCH_REFIT_EVERY = 3       # backtest: refit GARCH every N entries, reuse between (see backtest_symbol)
 
 
 @dataclass(frozen=True)
@@ -261,6 +262,8 @@ def backtest_symbol(
     closes = bars["close"].to_numpy()
     idx = bars.index
     i = MIN_TRAIL_BARS
+    entry_no = 0
+    fv_cache: float | None = None   # reused GARCH forecast between refits
     while i + horizon < n:
         trail = bars.iloc[: i + 1]
         spot = float(closes[i])
@@ -278,12 +281,18 @@ def backtest_symbol(
         iv = rv * (1.0 + vrp)
         chain = synth_chain(spot, iv, horizon)
         regime = (regime_map or {}).get(idx[i].date())
+        # GARCH is the per-entry bottleneck but barely moves over `step` days --
+        # refit every GARCH_REFIT_EVERY entries and reuse in between (the live
+        # path still refits every call; this speedup is backtest-only).
+        if entry_no % GARCH_REFIT_EVERY == 0:
+            fv_cache = options_math.forecast_vol_garch(trail, horizon)
+        entry_no += 1
         result = options_engine.build_analysis(
             code=code, name=name, as_of=str(idx[i].date()), spot=spot,
             decision=ta.decision, score=ta.score, bars=trail,
             contracts=chain, expiry=str(idx[i + horizon].date()), dte=horizon,
             holds=False, shares=0.0, confidence=ta.confidence,
-            market_regime=regime,
+            market_regime=regime, forecast_vol_pct=fv_cache if fv_cache is not None else -1.0,
         )
         exit_spot = float(closes[i + horizon])
         path_spots = closes[i + 1 : i + horizon + 1]   # realized daily closes, entry+1..expiry
