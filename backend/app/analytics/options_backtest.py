@@ -263,10 +263,11 @@ def format_report(trades: list[Trade], meta: dict) -> str:
     return "\n".join(lines)
 
 
-def run(symbols: list[str], *, horizon: int, step: int, vrp: float, lookback_days: int,
-        use_regime: bool = True) -> str:
-    """Fetch real Moomoo equity history for each symbol and backtest. Reuses the
-    ML BarStore fetch path (same Moomoo throttle/cache as train.py)."""
+def _fetch_all(symbols: list[str], lookback_days: int, horizon: int):
+    """Fetch every symbol's bars UP FRONT (plus the benchmark), then close the
+    broker path. Decoupling the fetch from the (multi-hour, broker-free) compute
+    phase means a dropped Moomoo connection can't waste an hour of walking --
+    and lets big universes fail their quota misses cleanly at the start."""
     import time
     from app.ml import data_store
     from app.services.analysis_service import BENCHMARK_CODE, service
@@ -274,64 +275,126 @@ def run(symbols: list[str], *, horizon: int, step: int, vrp: float, lookback_day
     KLINE_MIN_INTERVAL_S = 0.55  # Moomoo 60-calls/30s cap, same as train.py
     store = data_store.BarStore()
 
-    regime_map: dict = {}
-    if use_regime:
-        try:
-            bench = store.update(BENCHMARK_CODE, service._client, service._lock,
-                                 lookback_days=lookback_days)
-            regime_map = regime_map_from_bench(bench)
-            print(f"  regime map: {len(regime_map)} dated reads from {BENCHMARK_CODE}", flush=True)
-        except Exception as e:  # noqa: BLE001
-            print(f"  regime map unavailable ({e}) -- gate off", flush=True)
+    bench_bars = None
+    try:
+        bench_bars = store.update(BENCHMARK_CODE, service._client, service._lock,
+                                  lookback_days=lookback_days)
+    except Exception as e:  # noqa: BLE001
+        print(f"  benchmark {BENCHMARK_CODE} fetch failed ({e}) -- regime gate will be off", flush=True)
 
-    all_trades: list[Trade] = []
-    for i, code in enumerate(symbols, 1):
+    bars_by_code: dict[str, pd.DataFrame] = {}
+    fetch_list = [c for c in symbols if c != BENCHMARK_CODE]
+    for i, code in enumerate(fetch_list, 1):
         time.sleep(KLINE_MIN_INTERVAL_S)
         try:
             bars = store.update(code, service._client, service._lock, lookback_days=lookback_days)
-        except Exception as e:  # noqa: BLE001 - no quote permission etc.
-            print(f"  [{i}/{len(symbols)}] {code}: SKIPPED -- {e}", flush=True)
+        except Exception as e:  # noqa: BLE001 - quota / no permission
+            print(f"  fetch [{i}/{len(fetch_list)}] {code}: SKIPPED -- {e}", flush=True)
             continue
         if bars is None or len(bars) < MIN_TRAIL_BARS + horizon:
-            print(f"  [{i}/{len(symbols)}] {code}: SKIPPED -- only {0 if bars is None else len(bars)} bars", flush=True)
+            print(f"  fetch [{i}/{len(fetch_list)}] {code}: SKIPPED -- only "
+                  f"{0 if bars is None else len(bars)} bars", flush=True)
             continue
-        t = backtest_symbol(code, code, bars, horizon=horizon, step=step, vrp=vrp,
-                            regime_map=regime_map or None)
-        all_trades.extend(t)
-        print(f"  [{i}/{len(symbols)}] {code}: {len(bars)} bars -> {len(t)} trades", flush=True)
+        bars_by_code[code] = bars
+    if BENCHMARK_CODE in symbols and bench_bars is not None and len(bench_bars) >= MIN_TRAIL_BARS + horizon:
+        bars_by_code[BENCHMARK_CODE] = bench_bars
+    print(f"  fetched {len(bars_by_code)}/{len(symbols)} symbols with usable history", flush=True)
+    return bars_by_code, bench_bars
 
-    return format_report(all_trades, {
-        "n_symbols": len(symbols), "horizon": horizon, "step": step, "vrp": vrp,
-        "regime": bool(regime_map),
-    })
+
+def _walk_all(bars_by_code: dict, *, horizon: int, step: int, vrp: float, regime_map: dict | None):
+    trades: list[Trade] = []
+    for j, (code, bars) in enumerate(bars_by_code.items(), 1):
+        t = backtest_symbol(code, code, bars, horizon=horizon, step=step, vrp=vrp,
+                            regime_map=regime_map)
+        trades.extend(t)
+        if j % 10 == 0 or j == len(bars_by_code):
+            print(f"    walked {j}/{len(bars_by_code)} symbols, {len(trades)} trades so far", flush=True)
+    return trades
+
+
+def run(symbols: list[str], *, horizon: int, step: int, vrp: float, lookback_days: int,
+        use_regime: bool = True, ab: bool = False) -> str:
+    """Fetch real Moomoo equity history once, then backtest. `ab=True` runs the
+    walk twice from that single fetch -- gate ON and gate OFF -- for a same-data
+    A/B of the regime gate (no double fetch, no double quota hit)."""
+    bars_by_code, bench_bars = _fetch_all(symbols, lookback_days, horizon)
+    if not bars_by_code:
+        return "No symbols returned usable history -- nothing to backtest."
+    regime_map = regime_map_from_bench(bench_bars) if bench_bars is not None else {}
+    print(f"  regime map: {len(regime_map)} dated reads", flush=True)
+
+    meta = {"n_symbols": len(bars_by_code), "horizon": horizon, "step": step, "vrp": vrp}
+    if ab:
+        print("  == walk A: gate ON ==", flush=True)
+        on = _walk_all(bars_by_code, horizon=horizon, step=step, vrp=vrp, regime_map=regime_map or None)
+        print("  == walk B: gate OFF ==", flush=True)
+        off = _walk_all(bars_by_code, horizon=horizon, step=step, vrp=vrp, regime_map=None)
+        rep_on = format_report(on, {**meta, "regime": True})
+        rep_off = format_report(off, {**meta, "regime": False})
+        return rep_on + "\n\n" + rep_off + "\n\n" + _ab_delta(on, off)
+
+    regime = regime_map if use_regime else {}
+    trades = _walk_all(bars_by_code, horizon=horizon, step=step, vrp=vrp, regime_map=regime or None)
+    return format_report(trades, {**meta, "regime": bool(regime)})
+
+
+def _ab_delta(on: list[Trade], off: list[Trade]) -> str:
+    """One-line-per-metric summary of the gate's effect, computed from the same
+    underlying bars (the only thing that differs is the gate)."""
+    def tot(ts):
+        n = len(ts)
+        wins = sum(1 for t in ts if t.win)
+        pnl = sum(t.pnl_per_share for t in ts)
+        return n, (100.0 * wins / n if n else 0.0), pnl, (pnl / n if n else 0.0)
+    n_on, wr_on, p_on, avg_on = tot(on)
+    n_off, wr_off, p_off, avg_off = tot(off)
+    return "\n".join([
+        "=" * 78,
+        "A/B: REGIME GATE ON vs OFF (same bars, same period)",
+        "-" * 78,
+        f"{'':<16}{'trades':>10}{'win%':>10}{'total P&L':>14}{'avg/trade':>12}",
+        f"{'gate OFF':<16}{n_off:>10}{wr_off:>9.1f}%{p_off:>14.1f}{avg_off:>12.3f}",
+        f"{'gate ON':<16}{n_on:>10}{wr_on:>9.1f}%{p_on:>14.1f}{avg_on:>12.3f}",
+        f"{'delta':<16}{n_on - n_off:>+10}{wr_on - wr_off:>+9.1f}%{p_on - p_off:>+14.1f}{avg_on - avg_off:>+12.3f}",
+        "=" * 78,
+    ])
 
 
 def main() -> None:
     import argparse
-    from app.ml import universe
+    from app.ml import data_store, universe
 
     ap = argparse.ArgumentParser(description="Synthetic backtest of the options strategist.")
     ap.add_argument("--symbols", default=None, help="comma-separated codes (e.g. US.AAPL,US.MSFT)")
     ap.add_argument("--universe", default=None,
-                    help="holdings | sp500 | smallcap | <file> (ignored if --symbols given)")
+                    help="cached | holdings | sp500 | smallcap | <file> (ignored if --symbols given)")
     ap.add_argument("--horizon", type=int, default=DEFAULT_HORIZON, help="tenor in trading days")
     ap.add_argument("--step", type=int, default=DEFAULT_STEP, help="roll cadence in trading days")
     ap.add_argument("--vrp", type=float, default=DEFAULT_VRP, help="vol risk premium (IV = realized x (1+vrp))")
     ap.add_argument("--lookback-days", type=int, default=1095)
     ap.add_argument("--max-symbols", type=int, default=20)
     ap.add_argument("--no-regime", action="store_true",
-                    help="disable the counter-regime gate (for A/B comparison)")
+                    help="disable the counter-regime gate")
+    ap.add_argument("--ab", action="store_true",
+                    help="run gate ON and OFF from one fetch and print an A/B delta")
     args = ap.parse_args()
 
     if args.symbols:
         symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    elif args.universe == "cached":
+        # US equities already in the bar-store cache -> guaranteed inside Moomoo's
+        # 7-day distinct-stock quota set, so a deep re-fetch costs no fresh quota.
+        import glob
+        files = glob.glob(str(data_store.bars_dir() / "US.*.parquet"))
+        symbols = sorted(os.path.basename(f)[:-8] for f in files)[: args.max_symbols]
     elif args.universe:
         symbols = [c for c in universe.resolve_universe(source=args.universe)][: args.max_symbols]
     else:
         ap.error("pass --symbols or --universe")
     print(f"Backtesting {len(symbols)} symbol(s)...\n", flush=True)
     report = run(symbols, horizon=args.horizon, step=args.step, vrp=args.vrp,
-                 lookback_days=args.lookback_days, use_regime=not args.no_regime)
+                 lookback_days=args.lookback_days, use_regime=not args.no_regime, ab=args.ab)
     print(report, flush=True)
     # The Moomoo SDK leaves non-daemon network threads running, so the process
     # won't exit on its own after the report is done -- force it, or the run
