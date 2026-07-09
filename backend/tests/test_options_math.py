@@ -85,6 +85,18 @@ def test_bsm_greeks_atm_call_delta_near_half():
     assert _approx(call["delta"] - put["delta"], 1.0, tol=1e-6)
 
 
+def test_bsm_price_put_call_parity():
+    # C - P = S - K*e^(-rT) must hold for any European BSM price pair.
+    s, k, iv, dte, r = 100.0, 105.0, 30.0, 45, 0.04
+    call = om.bsm_price(s, k, iv, dte, "Call", rate=r)
+    put = om.bsm_price(s, k, iv, dte, "Put", rate=r)
+    parity = s - k * np.exp(-r * dte / 365.0)
+    assert _approx(call - put, parity, tol=1e-6), (call - put, parity)
+    # deep ITM call ~ intrinsic + small time value; deep OTM put ~ 0
+    assert om.bsm_price(200.0, 100.0, iv, dte, "Call") > 99.0
+    assert om.bsm_price(50.0, 100.0, iv, dte, "Call") < 1.0
+
+
 # --- Payoff curve -----------------------------------------------------------------
 
 def _find_crossings(payoff: np.ndarray, grid: np.ndarray) -> np.ndarray:

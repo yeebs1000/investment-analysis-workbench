@@ -1,0 +1,94 @@
+"""Offline checks for the synthetic options backtest. Fully deterministic --
+synthetic GBM price path, no network/broker -- so it's safe for CI.
+
+    python -m tests.test_options_backtest
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+from app.analytics import options_backtest as bt
+from app.analytics import options_math as om
+
+
+def _gbm_bars(n=400, mu=0.0003, sigma=0.02, seed=0) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2023-01-01", periods=n)
+    close = 100 * np.exp(np.cumsum(rng.normal(mu, sigma, n)))
+    return pd.DataFrame({
+        "open": close, "high": close * 1.01, "low": close * 0.99,
+        "close": close, "volume": 1e6,
+    }, index=dates)
+
+
+def test_synth_chain_prices_are_sane():
+    ch = bt.synth_chain(100.0, 25.0, 35)
+    assert not ch.empty
+    assert {"right", "strike", "delta", "iv", "price", "bid", "ask", "oi", "code"} <= set(ch.columns)
+    # ATM call: 0 < price < spot; bid < ask
+    atm = ch[(ch.right == "Call") & (ch.strike.between(99, 101))]
+    assert (atm["price"] > 0).all() and (atm["price"] < 100).all()
+    assert (ch["bid"] <= ch["ask"]).all()
+    # calls have positive delta, puts negative
+    assert (ch[ch.right == "Call"]["delta"] > 0).all()
+    assert (ch[ch.right == "Put"]["delta"] < 0).all()
+
+
+def test_bsm_price_matches_intrinsic_at_zero_vol_limit():
+    # tiny vol, short tenor -> price collapses to intrinsic
+    itm = om.bsm_price(120.0, 100.0, 1.0, 1, "Call")
+    assert abs(itm - 20.0) < 0.5, itm
+    otm = om.bsm_price(80.0, 100.0, 1.0, 1, "Call")
+    assert otm < 0.5, otm
+
+
+def test_payoff_mark_matches_manual_bull_put_spread():
+    # a bull put spread: sell 95 put @2, buy 90 put @1 -> credit 1.
+    # at expiry S=100 (above both): keep full credit = +1/share.
+    from app.data.models import OptionLeg
+    legs = [
+        OptionLeg(action="Sell", right="Put", strike=95, expiry="x", price=2.0),
+        OptionLeg(action="Buy", right="Put", strike=90, expiry="x", price=1.0),
+    ]
+    pnl_above = float(om.payoff_at_expiry(legs, np.array([100.0]))[0])
+    assert abs(pnl_above - 1.0) < 1e-9, pnl_above
+    # at S=90 (both ITM): loss = width - credit = 5 - 1 = -4.
+    pnl_below = float(om.payoff_at_expiry(legs, np.array([90.0]))[0])
+    assert abs(pnl_below - (-4.0)) < 1e-9, pnl_below
+
+
+def test_backtest_runs_and_stats_are_bounded():
+    bars = _gbm_bars()
+    trades = bt.backtest_symbol("US.TEST", "Test", bars, horizon=21, step=15)
+    assert len(trades) > 0
+    stats = bt.aggregate(trades)
+    assert stats["__ALL__"].n == len(trades)
+    for k, s in stats.items():
+        if s.n:
+            assert 0.0 <= s.win_rate <= 100.0
+            assert s.predicted_pop is None or 0.0 <= s.predicted_pop <= 100.0
+    # win flag must be consistent with sign of P&L
+    for t in trades:
+        assert t.win == (t.pnl_per_share > 0)
+
+
+def test_report_renders():
+    bars = _gbm_bars(seed=3)
+    trades = bt.backtest_symbol("US.TEST", "Test", bars, horizon=21, step=15)
+    txt = bt.format_report(bt.aggregate(trades), {"n_symbols": 1, "horizon": 21, "step": 15, "vrp": 0.05})
+    assert "SYNTHETIC BACKTEST" in txt and "pred POP" in txt
+
+
+def main():
+    tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
+    passed = 0
+    for t in tests:
+        t()
+        print(f"  PASS  {t.__name__}")
+        passed += 1
+    print(f"\n{passed}/{len(tests)} options-backtest tests passed.")
+
+
+if __name__ == "__main__":
+    main()

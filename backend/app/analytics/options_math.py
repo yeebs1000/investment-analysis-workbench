@@ -148,6 +148,30 @@ def bsm_greeks(
     return {"delta": float(delta), "gamma": float(gamma), "theta": float(theta), "vega": float(vega)}
 
 
+def bsm_price(
+    spot: float, strike: float, iv_pct: float | None, dte: int | None, right: str, rate: float = 0.0,
+) -> float | None:
+    """European Black-Scholes-Merton option price (no dividend). Companion to
+    bsm_greeks -- the strategist reads real broker quotes, so live code never
+    needs this, but the synthetic backtest (no historical chains exist) must
+    price modeled contracts off a vol assumption. Same d1/d2 as bsm_greeks."""
+    if not spot or spot <= 0 or not strike or strike <= 0:
+        return None
+    if iv_pct is None or iv_pct <= 0 or dte is None or dte <= 0:
+        return None
+    sigma = iv_pct / 100.0
+    t = dte / 365.0
+    sqrt_t = np.sqrt(t)
+    d1 = (np.log(spot / strike) + (rate + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    disc = np.exp(-rate * t)
+    if right.upper() == "CALL":
+        px = spot * norm.cdf(d1) - strike * disc * norm.cdf(d2)
+    else:
+        px = strike * disc * norm.cdf(-d2) - spot * norm.cdf(-d1)
+    return float(max(px, 0.0))
+
+
 def default_price_grid(spot: float, pct: float = 0.4, n: int = 200) -> np.ndarray:
     """A dense price grid spanning spot +/- pct, for payoff/POP evaluation."""
     lo = max(spot * (1.0 - pct), 0.01)
