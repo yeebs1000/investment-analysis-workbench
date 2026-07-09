@@ -921,6 +921,17 @@ class AnalysisService:
             book_value_usd = None
         earnings = finnhub_client.next_earnings(code)  # None => unknown, engine states so
 
+        # market regime (benchmark vs 200dma) -- same deterministic signal the
+        # options backtest validates. None (e.g. benchmark fetch failed) simply
+        # disables the counter-regime gate rather than blocking the analysis.
+        market_regime = None
+        try:
+            bench = self._benchmark(DEFAULT_TF)
+            if bench is not None and not bench.empty:
+                market_regime = options_engine.benchmark_regime(bench["close"])
+        except Exception:  # noqa: BLE001
+            market_regime = None
+
         # 5. strategist (analyst consensus, technical target/stop, plus the new
         # event/liquidity/sizing/term-structure context).
         result = options_engine.build_analysis(
@@ -930,6 +941,7 @@ class AnalysisService:
             analyst=ta.analyst_consensus, stock_target=ta.target, stock_stop=ta.stop,
             confidence=ta.confidence, earnings=earnings, book_value_usd=book_value_usd,
             next_atm_iv_pct=next_atm_iv, next_expiry=next_expiry,
+            market_regime=market_regime,
         )
         return result
 

@@ -180,7 +180,11 @@ class MoomooClient:
         end: str | None = None,
         ktype: str = "day",
         lookback_days: int = 430,
-        max_count: int = 1000,
+        # None = return the FULL window in one response (verified live: 6.5y of
+        # daily bars in one call). A finite cap silently returns the OLDEST
+        # bars of a too-long window (see comment below), which made long
+        # lookbacks end years in the past -- a truncation bug, not a feature.
+        max_count: int | None = None,
     ) -> pd.DataFrame:
         # IMPORTANT: without an explicit window OpenD returns the OLDEST bars in
         # the permitted history, not the most recent ones. Default to a window

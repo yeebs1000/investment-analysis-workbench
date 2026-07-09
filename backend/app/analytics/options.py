@@ -31,6 +31,16 @@ LIQ_MIN_OI = 50              # open interest below this -> thin-contract warning
 DEFAULT_RISK_BUDGET_FRAC = 0.01   # max loss per trade as a fraction of book value (1%)
 LOW_CONFIDENCE_THRESHOLD = 0.45   # technical confidence below this -> directional read is
                                    # flagged and neutral structures are offered alongside
+
+# --- market-regime gate ------------------------------------------------------
+# Counter-regime directional trades (bearish structures in a bull market and
+# vice versa) need MORE conviction than with-regime ones: the 35d synthetic
+# backtest showed counter-trend debit spreads were the single worst bucket
+# (Put Debit Spread: 29% win rate in a bull tape). Below this confidence a
+# counter-regime read is demoted to neutral -- protective structures for
+# holders (collar) are exempt, protection is never gated away.
+REGIME_SMA = 200                  # benchmark close vs its 200-day SMA: the boring classic
+REGIME_OVERRIDE_CONFIDENCE = 0.60 # confidence needed to trade AGAINST the regime
 SKEW_NOTE_THRESHOLD_PTS = 3.0     # |25d put IV - 25d call IV| above this earns a skew note
 TERM_NOTE_THRESHOLD_PTS = 2.0     # front-vs-next ATM IV gap above this earns a term note
 
@@ -44,6 +54,20 @@ def _realized_vol_close_close(close: pd.Series, window: int = 30) -> float | Non
     if window < 5:
         return None
     return float(rets.tail(window).std(ddof=0) * np.sqrt(252) * 100.0)
+
+
+def benchmark_regime(bench_close: pd.Series | None) -> str | None:
+    """"bull" / "bear" from the benchmark's close vs its 200-day SMA, or None
+    when there isn't enough history to say. Deterministic and computable at any
+    historical date, unlike the live-only FRED macro read -- so the SAME signal
+    the backtest validates is the one the live strategist uses."""
+    if bench_close is None or len(bench_close) < REGIME_SMA:
+        return None
+    sma = float(bench_close.rolling(REGIME_SMA).mean().iloc[-1])
+    last = float(bench_close.iloc[-1])
+    if not (np.isfinite(sma) and np.isfinite(last)):
+        return None
+    return "bull" if last >= sma else "bear"
 
 
 def _bias(decision: Decision | None) -> str:
@@ -125,6 +149,7 @@ def build_analysis(
     risk_budget_frac: float = DEFAULT_RISK_BUDGET_FRAC,
     next_atm_iv_pct: float | None = None,
     next_expiry: str | None = None,
+    market_regime: str | None = None,   # "bull" | "bear" | None=unknown (see benchmark_regime)
 ) -> OptionsAnalysis:
     out = OptionsAnalysis(
         code=code, name=name, as_of=as_of, spot=spot,
@@ -180,6 +205,29 @@ def build_analysis(
         out.iv_vs_realized = round(ratio, 2)
         out.iv_regime = "Elevated" if ratio >= IV_ELEVATED_RATIO else "Cheap" if ratio <= IV_CHEAP_RATIO else "Normal"
     bias = _bias(decision)
+
+    # --- market-regime gate: counter-regime directional reads need conviction.
+    # raw_bias survives for PROTECTIVE structures (collar) -- a holder's hedge
+    # on a bearish read is never gated away, only speculative direction is.
+    raw_bias = bias
+    counter_regime = (
+        (bias == "bearish" and market_regime == "bull")
+        or (bias == "bullish" and market_regime == "bear")
+    )
+    if counter_regime and (confidence is None or confidence < REGIME_OVERRIDE_CONFIDENCE):
+        bias = "neutral"
+        out.notes.append(
+            f"⚖ Regime gate: the {raw_bias} read fights a {market_regime} market "
+            f"(benchmark vs its {REGIME_SMA}-day average) without high conviction"
+            + (f" ({confidence:.0%} < {REGIME_OVERRIDE_CONFIDENCE:.0%})" if confidence is not None else "")
+            + f" — directional {raw_bias} structures are withheld; neutral structures shown instead."
+        )
+    elif counter_regime:
+        out.notes.append(
+            f"⚖ Counter-regime trade: this {bias} read fights a {market_regime} market — "
+            f"kept because conviction is high ({confidence:.0%}), but size accordingly."
+        )
+
     iv_high = out.iv_regime == "Elevated"
     iv_low = out.iv_regime == "Cheap"
 
@@ -285,7 +333,9 @@ def build_analysis(
     # position through a rough patch/binary event without selling: buy an OTM
     # put (hard floor), pay for it by selling an OTM call (capped upside) —
     # often near zero net cost.
-    if holds and shares >= CONTRACT_SIZE and (bias == "bearish" or earnings_within_tenor):
+    # raw_bias, not bias: a regime-demoted bearish read still justifies HEDGING
+    # an existing position -- the gate withholds speculation, never protection.
+    if holds and shares >= CONTRACT_SIZE and (raw_bias == "bearish" or earnings_within_tenor):
         put_leg = _by_delta(puts, TARGET_DELTA)
         call_leg = _by_delta(calls, TARGET_DELTA)
         if (
@@ -297,7 +347,7 @@ def build_analysis(
             put_cost = _num(put_leg.get("price")) or 0.0
             net = call_prem - put_cost          # + = collar pays you, - = costs you
             k_put, k_call = float(put_leg["strike"]), float(call_leg["strike"])
-            why = ("the technical read is bearish" if bias == "bearish"
+            why = ("the technical read is bearish" if raw_bias == "bearish"
                    else f"earnings land inside this tenor ({out.earnings_date})")
             strategies.append(OptionStrategy(
                 name="Collar",

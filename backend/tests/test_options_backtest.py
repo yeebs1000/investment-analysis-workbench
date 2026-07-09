@@ -76,8 +76,24 @@ def test_backtest_runs_and_stats_are_bounded():
 def test_report_renders():
     bars = _gbm_bars(seed=3)
     trades = bt.backtest_symbol("US.TEST", "Test", bars, horizon=21, step=15)
-    txt = bt.format_report(bt.aggregate(trades), {"n_symbols": 1, "horizon": 21, "step": 15, "vrp": 0.05})
+    txt = bt.format_report(trades, {"n_symbols": 1, "horizon": 21, "step": 15, "vrp": 0.05})
     assert "SYNTHETIC BACKTEST" in txt and "pred POP" in txt
+
+
+def test_regime_map_and_plumbing():
+    bench = _gbm_bars(n=400, mu=0.001, seed=7)   # drifting up -> mostly bull
+    rmap = bt.regime_map_from_bench(bench)
+    # no reads until the 200-day SMA exists; one read per bar after that
+    assert len(rmap) == len(bench) - 199
+    assert set(rmap.values()) <= {"bull", "bear"}
+    # the map keys align with bar dates and carry into trades
+    bars = _gbm_bars(n=400, seed=0)
+    trades = bt.backtest_symbol("US.TEST", "Test", bars, horizon=21, step=15, regime_map=rmap)
+    assert trades and all(t.regime in ("bull", "bear", None) for t in trades)
+    assert any(t.regime is not None for t in trades)
+    # per-regime section renders
+    txt = bt.format_report(trades, {"n_symbols": 1, "horizon": 21, "step": 15, "vrp": 0.05, "regime": True})
+    assert "regime only" in txt
 
 
 def main():

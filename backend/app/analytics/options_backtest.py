@@ -97,6 +97,7 @@ class Trade:
     exit_spot: float
     pnl_per_share: float
     win: bool
+    regime: str | None = None   # market regime at entry ("bull"/"bear"/None)
 
 
 @dataclass
@@ -128,14 +129,32 @@ class StratStats:
         return round(self.pop_sum / self.pop_n, 1) if self.pop_n else None
 
 
+def regime_map_from_bench(bench_bars: pd.DataFrame | None) -> dict:
+    """{date -> "bull"/"bear"} from the benchmark's close vs its 200-day SMA --
+    the same signal options.benchmark_regime computes live, vectorized over
+    history so each backtest entry date gets the regime as it stood THEN
+    (no lookahead: the SMA at date t uses only bars up to t)."""
+    if bench_bars is None or bench_bars.empty or len(bench_bars) < options_engine.REGIME_SMA:
+        return {}
+    close = bench_bars["close"]
+    sma = close.rolling(options_engine.REGIME_SMA).mean()
+    out = {}
+    for ts, c, m in zip(bench_bars.index, close, sma):
+        if np.isfinite(c) and np.isfinite(m):
+            out[ts.date()] = "bull" if c >= m else "bear"
+    return out
+
+
 def backtest_symbol(
     code: str, name: str, bars: pd.DataFrame, *,
     horizon: int = DEFAULT_HORIZON, step: int = DEFAULT_STEP, vrp: float = DEFAULT_VRP,
-    ppy: float = 252.0,
+    ppy: float = 252.0, regime_map: dict | None = None,
 ) -> list[Trade]:
     """Walk `bars` forward, entering strategies every `step` trading days and
     marking them to the realized close `horizon` bars later. `bars` is an
-    ascending OHLCV frame (normalize.bars_from_kline output)."""
+    ascending OHLCV frame (normalize.bars_from_kline output). `regime_map`
+    (date -> "bull"/"bear") enables the strategist's counter-regime gate,
+    exactly as the live path does; None leaves the gate off."""
     trades: list[Trade] = []
     n = len(bars)
     closes = bars["close"].to_numpy()
@@ -157,11 +176,13 @@ def backtest_symbol(
             continue
         iv = rv * (1.0 + vrp)
         chain = synth_chain(spot, iv, horizon)
+        regime = (regime_map or {}).get(idx[i].date())
         result = options_engine.build_analysis(
             code=code, name=name, as_of=str(idx[i].date()), spot=spot,
             decision=ta.decision, score=ta.score, bars=trail,
             contracts=chain, expiry=str(idx[i + horizon].date()), dte=horizon,
             holds=False, shares=0.0, confidence=ta.confidence,
+            market_regime=regime,
         )
         exit_spot = float(closes[i + horizon])
         for s in result.strategies:
@@ -172,7 +193,7 @@ def backtest_symbol(
                 date=str(idx[i].date()), symbol=code, strategy=s.name, direction=s.direction,
                 decision=ta.decision.value, pop_pct=s.pop_pct, ev_per_share=s.ev_per_share,
                 entry_spot=round(spot, 2), exit_spot=round(exit_spot, 2),
-                pnl_per_share=round(pnl, 3), win=pnl > 0,
+                pnl_per_share=round(pnl, 3), win=pnl > 0, regime=regime,
             ))
         i += step
     return trades
@@ -188,18 +209,8 @@ def aggregate(trades: list[Trade]) -> dict[str, StratStats]:
     return stats
 
 
-def format_report(stats: dict[str, StratStats], meta: dict) -> str:
-    """Plain-text calibration report. The headline column is predicted-POP vs
-    realized win-rate: if they track, the strategist's probability model is
-    calibrated; a large persistent gap means it isn't."""
+def _table(stats: dict[str, StratStats]) -> list[str]:
     lines = [
-        "=" * 78,
-        "OPTIONS STRATEGIST -- SYNTHETIC BACKTEST",
-        "=" * 78,
-        f"Symbols: {meta['n_symbols']}   Entries: every {meta['step']} trading days   "
-        f"Tenor: {meta['horizon']} trading days   VRP: {meta['vrp']:.0%}",
-        f"Modeled IV = trailing Yang-Zhang realized vol x (1+VRP); marks hold-to-expiry.",
-        "-" * 78,
         f"{'Strategy':<26}{'n':>5}{'win%':>8}{'pred POP':>10}{'avg P&L/sh':>12}",
         "-" * 78,
     ]
@@ -214,6 +225,33 @@ def format_report(stats: dict[str, StratStats], meta: dict) -> str:
         lines.append(
             f"{label[:26]:<26}{s.n:>5}{s.win_rate:>7.1f}%{pop:>10}{s.avg_pnl:>12.3f}"
         )
+    return lines
+
+
+def format_report(trades: list[Trade], meta: dict) -> str:
+    """Plain-text calibration report. The headline column is predicted-POP vs
+    realized win-rate: if they track, the strategist's probability model is
+    calibrated; a large persistent gap means it isn't. When trades carry a
+    market regime, per-regime tables show how structures behaved in bull vs
+    bear tape -- the whole point of the counter-regime gate."""
+    lines = [
+        "=" * 78,
+        "OPTIONS STRATEGIST -- SYNTHETIC BACKTEST",
+        "=" * 78,
+        f"Symbols: {meta['n_symbols']}   Entries: every {meta['step']} trading days   "
+        f"Tenor: {meta['horizon']} trading days   VRP: {meta['vrp']:.0%}   "
+        f"Regime gate: {'ON' if meta.get('regime') else 'OFF'}",
+        f"Modeled IV = trailing Yang-Zhang realized vol x (1+VRP); marks hold-to-expiry.",
+        "-" * 78,
+    ]
+    lines += _table(aggregate(trades))
+    for regime in ("bull", "bear"):
+        sub = [t for t in trades if t.regime == regime]
+        if not sub:
+            continue
+        span = f"{min(t.date for t in sub)} .. {max(t.date for t in sub)}"
+        lines += ["", f"--- {regime.upper()} regime only ({len(sub)} trades, {span}) " + "-" * 20]
+        lines += _table(aggregate(sub))
     lines += [
         "-" * 78,
         "win% = fraction of entries with P&L > 0 at expiry on the REAL price path.",
@@ -225,34 +263,46 @@ def format_report(stats: dict[str, StratStats], meta: dict) -> str:
     return "\n".join(lines)
 
 
-def run(symbols: list[str], *, horizon: int, step: int, vrp: float, lookback_days: int) -> str:
+def run(symbols: list[str], *, horizon: int, step: int, vrp: float, lookback_days: int,
+        use_regime: bool = True) -> str:
     """Fetch real Moomoo equity history for each symbol and backtest. Reuses the
     ML BarStore fetch path (same Moomoo throttle/cache as train.py)."""
     import time
     from app.ml import data_store
-    from app.services.analysis_service import service
+    from app.services.analysis_service import BENCHMARK_CODE, service
 
     KLINE_MIN_INTERVAL_S = 0.55  # Moomoo 60-calls/30s cap, same as train.py
     store = data_store.BarStore()
+
+    regime_map: dict = {}
+    if use_regime:
+        try:
+            bench = store.update(BENCHMARK_CODE, service._client, service._lock,
+                                 lookback_days=lookback_days)
+            regime_map = regime_map_from_bench(bench)
+            print(f"  regime map: {len(regime_map)} dated reads from {BENCHMARK_CODE}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"  regime map unavailable ({e}) -- gate off", flush=True)
+
     all_trades: list[Trade] = []
     for i, code in enumerate(symbols, 1):
-        if i > 1:
-            time.sleep(KLINE_MIN_INTERVAL_S)
+        time.sleep(KLINE_MIN_INTERVAL_S)
         try:
             bars = store.update(code, service._client, service._lock, lookback_days=lookback_days)
         except Exception as e:  # noqa: BLE001 - no quote permission etc.
-            print(f"  [{i}/{len(symbols)}] {code}: SKIPPED -- {e}")
+            print(f"  [{i}/{len(symbols)}] {code}: SKIPPED -- {e}", flush=True)
             continue
         if bars is None or len(bars) < MIN_TRAIL_BARS + horizon:
-            print(f"  [{i}/{len(symbols)}] {code}: SKIPPED -- only {0 if bars is None else len(bars)} bars")
+            print(f"  [{i}/{len(symbols)}] {code}: SKIPPED -- only {0 if bars is None else len(bars)} bars", flush=True)
             continue
-        t = backtest_symbol(code, code, bars, horizon=horizon, step=step, vrp=vrp)
+        t = backtest_symbol(code, code, bars, horizon=horizon, step=step, vrp=vrp,
+                            regime_map=regime_map or None)
         all_trades.extend(t)
         print(f"  [{i}/{len(symbols)}] {code}: {len(bars)} bars -> {len(t)} trades", flush=True)
 
-    stats = aggregate(all_trades)
-    return format_report(stats, {
+    return format_report(all_trades, {
         "n_symbols": len(symbols), "horizon": horizon, "step": step, "vrp": vrp,
+        "regime": bool(regime_map),
     })
 
 
@@ -269,6 +319,8 @@ def main() -> None:
     ap.add_argument("--vrp", type=float, default=DEFAULT_VRP, help="vol risk premium (IV = realized x (1+vrp))")
     ap.add_argument("--lookback-days", type=int, default=1095)
     ap.add_argument("--max-symbols", type=int, default=20)
+    ap.add_argument("--no-regime", action="store_true",
+                    help="disable the counter-regime gate (for A/B comparison)")
     args = ap.parse_args()
 
     if args.symbols:
@@ -279,7 +331,7 @@ def main() -> None:
         ap.error("pass --symbols or --universe")
     print(f"Backtesting {len(symbols)} symbol(s)...\n", flush=True)
     report = run(symbols, horizon=args.horizon, step=args.step, vrp=args.vrp,
-                 lookback_days=args.lookback_days)
+                 lookback_days=args.lookback_days, use_regime=not args.no_regime)
     print(report, flush=True)
     # The Moomoo SDK leaves non-daemon network threads running, so the process
     # won't exit on its own after the report is done -- force it, or the run

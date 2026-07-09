@@ -183,6 +183,59 @@ def test_straddle_built_when_neutral_and_iv_cheap():
     assert straddles[0].pop_pct is not None
 
 
+def test_benchmark_regime_reads():
+    up = pd.Series(np.linspace(80, 120, 250))
+    down = pd.Series(np.linspace(120, 80, 250))
+    assert opt.benchmark_regime(up) == "bull"
+    assert opt.benchmark_regime(down) == "bear"
+    assert opt.benchmark_regime(up.iloc[:100]) is None   # not enough history
+    assert opt.benchmark_regime(None) is None
+
+
+def _build_bearish(confidence, market_regime, holds=False, shares=0.0):
+    spot = 100.0
+    bars = _simulate_ohlc_from_path(n_days=120, seed=4, daily_vol=0.01)
+    contracts = _synthetic_contracts(spot, iv_pct=60.0, dte=30)   # elevated IV
+    return opt.build_analysis(
+        code="TEST", name="Test Co", as_of=None, spot=spot,
+        decision=Decision.SELL, score=30.0, bars=bars, contracts=contracts,
+        expiry="2099-01-01", dte=30, holds=holds, shares=shares,
+        confidence=confidence, market_regime=market_regime,
+    )
+
+
+def test_regime_gate_demotes_low_conviction_counter_trend():
+    result = _build_bearish(confidence=0.40, market_regime="bull")
+    assert not any(s.direction == "Bearish" for s in result.strategies), \
+        [s.name for s in result.strategies]
+    assert any("Regime gate" in n for n in result.notes)
+    # the neutral menu opens instead of leaving an empty page
+    assert any(s.direction == "Neutral" for s in result.strategies)
+
+
+def test_regime_gate_respects_high_conviction():
+    result = _build_bearish(confidence=0.80, market_regime="bull")
+    assert any(s.direction == "Bearish" for s in result.strategies)
+    assert any("Counter-regime" in n for n in result.notes)
+
+
+def test_regime_gate_inactive_when_aligned_or_unknown():
+    # bearish read in a BEAR market: no gate, structures kept
+    aligned = _build_bearish(confidence=0.40, market_regime="bear")
+    assert any(s.direction == "Bearish" for s in aligned.strategies)
+    # unknown regime: gate can't fire
+    unknown = _build_bearish(confidence=0.40, market_regime=None)
+    assert any(s.direction == "Bearish" for s in unknown.strategies)
+
+
+def test_regime_gate_never_blocks_collar():
+    # holder + demoted bearish read: speculation withheld, protection kept
+    result = _build_bearish(confidence=0.40, market_regime="bull", holds=True, shares=200.0)
+    names = {s.name for s in result.strategies}
+    assert "Collar" in names, names
+    assert not any(s.direction == "Bearish" for s in result.strategies)
+
+
 def test_existing_strategies_unaffected():
     spot = 100.0
     bars = _simulate_ohlc_from_path(n_days=120, seed=3, daily_vol=0.01)
