@@ -164,6 +164,9 @@ class Trade:
     managed_pnl: float | None = None    # P&L under the early-management overlay
     exit_reason: str | None = None      # profit_target | stop_be | expiry
     days_held: int | None = None
+    # capital at risk per share (the structure's max loss at entry). P&L/share is
+    # not comparable across a $60 stock and a $1000 one; P&L / risk is.
+    risk_per_share: float | None = None
 
 
 @dataclass
@@ -177,6 +180,8 @@ class StratStats:
     m_pnl_sum: float = 0.0     # managed-overlay P&L
     held_sum: int = 0          # trading days held under management
     early_closes: int = 0      # trades exited before expiry by the overlay
+    ror_sum: float = 0.0       # sum of per-trade P&L / capital-at-risk
+    ror_n: int = 0
 
     def add(self, t: Trade) -> None:
         self.n += 1
@@ -185,6 +190,9 @@ class StratStats:
         if t.pop_pct is not None:
             self.pop_sum += t.pop_pct
             self.pop_n += 1
+        if t.risk_per_share and t.risk_per_share > 0:
+            self.ror_sum += t.pnl_per_share / t.risk_per_share
+            self.ror_n += 1
         if t.managed_pnl is not None:
             self.m_pnl_sum += t.managed_pnl
             self.m_wins += 1 if t.managed_pnl > 0 else 0
@@ -214,6 +222,12 @@ class StratStats:
     @property
     def avg_days_held(self) -> float | None:
         return round(self.held_sum / self.n, 1) if self.n else None
+
+    @property
+    def avg_return_on_risk_pct(self) -> float | None:
+        """Mean per-trade P&L as % of that trade's capital at risk -- the
+        comparable-across-stocks unit that per-share P&L is not."""
+        return round(100.0 * self.ror_sum / self.ror_n, 1) if self.ror_n else None
 
 
 def regime_map_from_bench(bench_bars: pd.DataFrame | None) -> dict:
@@ -284,6 +298,7 @@ def backtest_symbol(
                 entry_spot=round(spot, 2), exit_spot=round(exit_spot, 2),
                 pnl_per_share=round(pnl, 3), win=pnl > 0, regime=regime,
                 managed_pnl=round(m_pnl, 3), exit_reason=reason, days_held=held,
+                risk_per_share=s.max_loss if (s.max_loss or 0) > 0 else None,
             ))
         i += step
     return trades
@@ -301,7 +316,7 @@ def aggregate(trades: list[Trade]) -> dict[str, StratStats]:
 
 def _table(stats: dict[str, StratStats]) -> list[str]:
     lines = [
-        f"{'Strategy':<26}{'n':>5}{'win%':>8}{'pred POP':>10}{'avg P&L/sh':>12}",
+        f"{'Strategy':<26}{'n':>6}{'win%':>8}{'pred POP':>10}{'avg P&L/sh':>12}{'ret/risk':>10}",
         "-" * 78,
     ]
     order = sorted((k for k in stats if k != "__ALL__"),
@@ -312,8 +327,9 @@ def _table(stats: dict[str, StratStats]) -> list[str]:
             continue
         label = "ALL" if k == "__ALL__" else k
         pop = f"{s.predicted_pop:.1f}%" if s.predicted_pop is not None else "  -"
+        ror = f"{s.avg_return_on_risk_pct:+.1f}%" if s.avg_return_on_risk_pct is not None else "  -"
         lines.append(
-            f"{label[:26]:<26}{s.n:>5}{s.win_rate:>7.1f}%{pop:>10}{s.avg_pnl:>12.3f}"
+            f"{label[:26]:<26}{s.n:>6}{s.win_rate:>7.1f}%{pop:>10}{s.avg_pnl:>12.3f}{ror:>10}"
         )
     return lines
 
