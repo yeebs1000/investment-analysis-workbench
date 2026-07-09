@@ -73,7 +73,21 @@ def test_daily_dedup_last_write_wins():
     perf.record_snapshot(111_111, 510.0, on=d)   # same day -> overwrite
     df = perf._load()
     assert len(df) == 1
-    assert abs(float(df.iloc[0]["equity_usd"]) - 111_111) < 1
+    assert abs(float(df.iloc[0]["invested_usd"]) - 111_111) < 1
+
+
+def test_return_is_on_invested_not_total():
+    # invested equity flat but total swings with a cash deposit -> return must be
+    # ~0 (driven by invested), NOT moved by the cash change.
+    _use_temp_store()
+    start = date(2026, 1, 1)
+    for i in range(5):
+        perf.record_snapshot(100_000, 500.0 * (1 + 0.02 * i / 4),
+                             total_usd=100_000 + 50_000 * i,   # cash piling up
+                             on=start + timedelta(days=i))
+    r = perf.compute_performance()
+    assert abs(r["account_return_pct"]) < 0.01, r["account_return_pct"]
+    assert r["basis"] == "invested"
 
 
 def test_bad_input_is_noop():

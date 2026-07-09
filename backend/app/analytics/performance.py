@@ -14,7 +14,15 @@ Honesty constraints:
   off two data points.
 - One row per calendar day (last write wins), so intraday re-fetches don't
   inflate the sample.
-- Equity is the FX-approx USD total already shown elsewhere; stated as approx.
+- Return is measured on INVESTED equity (market value of positions, cash
+  EXCLUDED). Idle cash earns ~0 and would drag the account return below a
+  fully-invested SPY, which flatters the benchmark unfairly; stripping cash
+  makes it an apples-to-apples read of how the picks did. Total equity is still
+  logged (`total_usd`) for reference. Caveat: invested value moves with your
+  own buys/sells too, so a day with a big deposit/withdrawal/rebalance distorts
+  that day's invested return (no clean cash-flow feed exists here to net it
+  out) -- fine for a buy-and-hold cadence, read single-day trade spikes with care.
+- Values are the FX-approx USD figures already shown elsewhere; stated as approx.
 """
 from __future__ import annotations
 
@@ -35,27 +43,39 @@ def _store_path() -> Path:
     return d / "performance.parquet"
 
 
+_COLUMNS = ["invested_usd", "total_usd", "spy_close"]
+
+
 def _load() -> pd.DataFrame:
     path = _store_path()
     if not path.exists():
-        return pd.DataFrame(columns=["date", "equity_usd", "spy_close"]).set_index("date")
+        return pd.DataFrame(columns=["date", *_COLUMNS]).set_index("date")
     df = pd.read_parquet(path)
     if "date" in df.columns:
         df = df.set_index("date")
     df.index = pd.to_datetime(df.index)
+    # Older logs stored only `equity_usd` (total, cash-included). Those rows have
+    # no `invested_usd`, so the invested series simply starts from the first new
+    # snapshot -- the old cash-included figure can't be converted to invested.
+    for c in _COLUMNS:
+        if c not in df.columns:
+            df[c] = float("nan")
     return df.sort_index()
 
 
-def record_snapshot(equity_usd: float | None, spy_close: float | None,
-                    on: date | None = None) -> None:
-    """Append (or overwrite) today's equity + SPY close. No-ops on bad input so
-    a snapshot failure never disturbs the request that triggered it."""
-    if not equity_usd or equity_usd <= 0 or not spy_close or spy_close <= 0:
+def record_snapshot(invested_usd: float | None, spy_close: float | None,
+                    total_usd: float | None = None, on: date | None = None) -> None:
+    """Append (or overwrite) today's INVESTED equity (cash excluded) + SPY close,
+    plus optional total equity for reference. No-ops on bad input so a snapshot
+    failure never disturbs the request that triggered it."""
+    if not invested_usd or invested_usd <= 0 or not spy_close or spy_close <= 0:
         return
     day = pd.Timestamp(on or date.today()).normalize()
     df = _load()
-    df.loc[day, "equity_usd"] = float(equity_usd)
+    df.loc[day, "invested_usd"] = float(invested_usd)
     df.loc[day, "spy_close"] = float(spy_close)
+    if total_usd and total_usd > 0:
+        df.loc[day, "total_usd"] = float(total_usd)
     df = df.sort_index()
     out = df.reset_index().rename(columns={"index": "date"})
     tmp = _store_path().with_suffix(".parquet.tmp")
@@ -66,37 +86,40 @@ def record_snapshot(equity_usd: float | None, spy_close: float | None,
 def compute_performance() -> dict:
     """Read the log and compute performance vs SPY. Always returns a dict with a
     `status` so the caller/UI can distinguish 'no data', 'building', 'ready'."""
-    df = _load().dropna(subset=["equity_usd", "spy_close"])
+    df = _load().dropna(subset=["invested_usd", "spy_close"])
     n = len(df)
     if n == 0:
         return {"status": "no_data", "days_tracked": 0,
-                "message": "No performance history yet — it starts logging from your first portfolio view."}
+                "message": "No performance history yet — it starts logging (on invested equity, "
+                           "cash excluded) from your first portfolio view."}
 
     first, last = df.iloc[0], df.iloc[-1]
-    acct_ret = (last["equity_usd"] / first["equity_usd"] - 1.0) * 100.0
+    acct_ret = (last["invested_usd"] / first["invested_usd"] - 1.0) * 100.0
     spy_ret = (last["spy_close"] / first["spy_close"] - 1.0) * 100.0
     common = {
         "status": "building" if n < MIN_DAYS_FOR_STATS else "ready",
         "days_tracked": n,
         "since": str(df.index[0].date()),
         "as_of": str(df.index[-1].date()),
-        "equity_usd": round(float(last["equity_usd"]), 2),
+        "equity_usd": round(float(last["invested_usd"]), 2),   # invested (cash excluded)
         "account_return_pct": round(float(acct_ret), 2),
         "spy_return_pct": round(float(spy_ret), 2),
         "excess_return_pct": round(float(acct_ret - spy_ret), 2),
         "beating_spy": bool(acct_ret > spy_ret),
+        "basis": "invested",   # return is on invested equity, not total (cash excluded)
     }
     if n < MIN_DAYS_FOR_STATS:
         common["message"] = (
-            f"Building history ({n}/{MIN_DAYS_FOR_STATS} days) — cumulative return vs SPY is "
-            f"shown, but risk-adjusted ratios need more data to be meaningful."
+            f"Building history ({n}/{MIN_DAYS_FOR_STATS} days) — cumulative return vs SPY "
+            f"(on invested equity, cash excluded) is shown, but risk-adjusted ratios need "
+            f"more data to be meaningful."
         )
         return common
 
     # Risk-adjusted stats off daily returns (reuse the same primitives the
     # per-symbol engine uses, so the math is consistent across the app).
-    beta, alpha_pct, _rel = ind.beta_alpha(df["equity_usd"], df["spy_close"], PERIODS_PER_YEAR)
-    acct_r = ind.log_returns(df["equity_usd"]).dropna()
+    beta, alpha_pct, _rel = ind.beta_alpha(df["invested_usd"], df["spy_close"], PERIODS_PER_YEAR)
+    acct_r = ind.log_returns(df["invested_usd"]).dropna()
     spy_r = ind.log_returns(df["spy_close"]).dropna()
     idx = acct_r.index.intersection(spy_r.index)
     excess_daily = (acct_r.loc[idx] - spy_r.loc[idx])
@@ -109,7 +132,7 @@ def compute_performance() -> dict:
         "alpha_pct": round(alpha_pct, 2) if alpha_pct is not None else None,
         "tracking_error_pct": round(tracking_error, 2) if tracking_error is not None else None,
         "information_ratio": round(info_ratio, 2) if info_ratio is not None else None,
-        "max_drawdown_pct": round(ind.max_drawdown_pct(df["equity_usd"]) or 0.0, 2),
+        "max_drawdown_pct": round(ind.max_drawdown_pct(df["invested_usd"]) or 0.0, 2),
         "spy_max_drawdown_pct": round(ind.max_drawdown_pct(df["spy_close"]) or 0.0, 2),
     })
     return common

@@ -287,8 +287,9 @@ function PerformanceCard() {
         </span>
       </div>
       <div className="perf-stats">
-        <span className="chip" title="Your book's cumulative return since tracking began">
+        <span className="chip" title="Cumulative return on your INVESTED equity (cash excluded, so idle cash doesn't drag you below a fully-invested SPY) since tracking began">
           You {(perf.account_return_pct ?? 0) >= 0 ? '+' : ''}{fmtNum(perf.account_return_pct, 2)}%
+          <span className="muted small"> (invested)</span>
         </span>
         <span className="chip" title="SPY cumulative return over the same window">
           SPY {(perf.spy_return_pct ?? 0) >= 0 ? '+' : ''}{fmtNum(perf.spy_return_pct, 2)}%

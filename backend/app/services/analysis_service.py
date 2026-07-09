@@ -317,6 +317,15 @@ class AnalysisService:
 
         return self._cache.get_or_set("account", ACCOUNT_TTL, fetch)
 
+    @staticmethod
+    def _invested_usd(acc) -> float | None:
+        """USD market value of positions -- total minus cash. Cash is excluded
+        from the performance-vs-SPY series so idle cash doesn't drag the account
+        return below a fully-invested benchmark (see performance.py)."""
+        if acc is None or acc.total_assets_usd is None:
+            return None
+        return round(acc.total_assets_usd - (acc.cash_usd or 0.0), 2)
+
     def get_positions(self) -> list[Position]:
         def fetch() -> list[Position]:
             positions: list[Position] = []
@@ -645,7 +654,8 @@ class AnalysisService:
                 # tracker. Daily-deduped; failure here never disturbs the read.
                 try:
                     performance.record_snapshot(
-                        account.total_assets_usd, float(bseries["close"].iloc[-1]),
+                        self._invested_usd(account), float(bseries["close"].iloc[-1]),
+                        total_usd=account.total_assets_usd,
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -824,7 +834,10 @@ class AnalysisService:
             acc = self.get_account()
             bseries = self._benchmark(DEFAULT_TF)
             if bseries is not None and not bseries.empty:
-                performance.record_snapshot(acc.total_assets_usd, float(bseries["close"].iloc[-1]))
+                performance.record_snapshot(
+                    self._invested_usd(acc), float(bseries["close"].iloc[-1]),
+                    total_usd=acc.total_assets_usd,
+                )
         except Exception:  # noqa: BLE001
             pass
         return performance.compute_performance()

@@ -231,6 +231,7 @@ export interface Performance {
   information_ratio?: number | null
   max_drawdown_pct?: number
   spy_max_drawdown_pct?: number
+  basis?: 'invested'   // return is on invested equity (cash excluded)
   message?: string
 }
 
