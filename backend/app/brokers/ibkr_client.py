@@ -174,14 +174,18 @@ class IBKRClient:
 
     # --- market data (for markets Moomoo can't serve, e.g. JP/SZ) ------
     def get_history_kline(self, code: str, ktype: str = "day",
-                          lookback_days: int = 430) -> "pd.DataFrame | None":
+                          lookback_days: int = 430,
+                          duration: str | None = None) -> "pd.DataFrame | None":
         if Stock is None:
             return None
         params = _stock_params(code)
         if params is None:
             return None            # market not in the allow-list -> skip IBKR
         sym, exch, ccy = params
-        duration, bar_size = _IB_BARS.get(ktype, _IB_BARS["day"])
+        default_duration, bar_size = _IB_BARS.get(ktype, _IB_BARS["day"])
+        # duration override (e.g. "7 Y") lets a backtest pull deep history the
+        # default per-ktype window (day="2 Y") is too short for.
+        duration = duration or default_duration
         with self._lock:
             # Tight timeout: this only runs as a fallback after Moomoo has already
             # failed, so a slow/unpermissioned IBKR market shouldn't stall the request.

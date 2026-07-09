@@ -263,42 +263,93 @@ def format_report(trades: list[Trade], meta: dict) -> str:
     return "\n".join(lines)
 
 
-def _fetch_all(symbols: list[str], lookback_days: int, horizon: int):
-    """Fetch every symbol's bars UP FRONT (plus the benchmark), then close the
-    broker path. Decoupling the fetch from the (multi-hour, broker-free) compute
-    phase means a dropped Moomoo connection can't waste an hour of walking --
-    and lets big universes fail their quota misses cleanly at the start."""
+IBKR_PACING_S = 10.0   # IB allows ~60 historical requests / 10 min -> 1 per 10s
+
+
+def _cache_deep_enough(bars, lookback_days: int, min_bars: int) -> bool:
+    """A cached series is reusable for a backtest if it has enough rows AND spans
+    most of the requested lookback -- the training cache is shallow (~750 bars to
+    2023), so this correctly rejects it and forces a deep re-fetch, while a
+    previously deep-fetched series is reused for free."""
+    if bars is None or len(bars) < min_bars:
+        return False
+    span_days = (bars.index.max() - bars.index.min()).days
+    return span_days >= lookback_days * 0.9
+
+
+def _fetch_all(symbols: list[str], lookback_days: int, horizon: int, use_ibkr: bool = True):
+    """Get every symbol's bars UP FRONT (plus the benchmark), then the compute
+    phase needs no broker -- so a dropped connection can't waste hours of walking.
+    Per symbol: a deep-enough cache is reused as-is; else Moomoo (free for names
+    already in its 7-day quota set); else IBKR (no quota wall, reaches the ~half
+    of the S&P 500 the Moomoo cache lacks). Anything fetched is saved back to the
+    cache, so the expensive IBKR pull is a one-time cost."""
     import time
+    from app.data import normalize
     from app.ml import data_store
     from app.services.analysis_service import BENCHMARK_CODE, service
 
     KLINE_MIN_INTERVAL_S = 0.55  # Moomoo 60-calls/30s cap, same as train.py
+    min_bars = MIN_TRAIL_BARS + horizon
     store = data_store.BarStore()
 
-    bench_bars = None
-    try:
-        bench_bars = store.update(BENCHMARK_CODE, service._client, service._lock,
-                                  lookback_days=lookback_days)
-    except Exception as e:  # noqa: BLE001
-        print(f"  benchmark {BENCHMARK_CODE} fetch failed ({e}) -- regime gate will be off", flush=True)
+    ibkr = None
+    if use_ibkr:
+        try:
+            from app.brokers.ibkr_client import IBKRClient
+            ibkr = IBKRClient(client_id=1150).connect()
+            print("  IBKR fallback: connected", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"  IBKR fallback unavailable ({e}) -- Moomoo only", flush=True)
+
+    def _get(code: str):
+        """(bars, source) or (None, None). Cache -> Moomoo -> IBKR."""
+        cached = store.load(code)
+        if _cache_deep_enough(cached, lookback_days, min_bars):
+            return cached, "cache"
+        try:
+            time.sleep(KLINE_MIN_INTERVAL_S)
+            b = store.update(code, service._client, service._lock, lookback_days=lookback_days)
+            if b is not None and len(b) >= min_bars:
+                return b, "moomoo"
+        except Exception:  # noqa: BLE001 - quota / no permission -> try IBKR
+            pass
+        if ibkr is not None:
+            try:
+                time.sleep(IBKR_PACING_S)
+                raw = ibkr.get_history_kline(code, ktype="day", duration="7 Y")
+                b = normalize.bars_from_kline(raw) if raw is not None else None
+                if b is not None and len(b) >= min_bars:
+                    store.save(code, b)   # persist -> reused free on the next run
+                    return b, "ibkr"
+            except Exception:  # noqa: BLE001
+                pass
+        return None, None
+
+    bench_bars, _ = _get(BENCHMARK_CODE)
+    if bench_bars is None:
+        print(f"  benchmark {BENCHMARK_CODE} unavailable -- regime gate will be off", flush=True)
 
     bars_by_code: dict[str, pd.DataFrame] = {}
+    src_counts = {"cache": 0, "moomoo": 0, "ibkr": 0}
     fetch_list = [c for c in symbols if c != BENCHMARK_CODE]
     for i, code in enumerate(fetch_list, 1):
-        time.sleep(KLINE_MIN_INTERVAL_S)
-        try:
-            bars = store.update(code, service._client, service._lock, lookback_days=lookback_days)
-        except Exception as e:  # noqa: BLE001 - quota / no permission
-            print(f"  fetch [{i}/{len(fetch_list)}] {code}: SKIPPED -- {e}", flush=True)
-            continue
-        if bars is None or len(bars) < MIN_TRAIL_BARS + horizon:
-            print(f"  fetch [{i}/{len(fetch_list)}] {code}: SKIPPED -- only "
-                  f"{0 if bars is None else len(bars)} bars", flush=True)
+        bars, src = _get(code)
+        if bars is None:
+            print(f"  fetch [{i}/{len(fetch_list)}] {code}: SKIPPED", flush=True)
             continue
         bars_by_code[code] = bars
-    if BENCHMARK_CODE in symbols and bench_bars is not None and len(bench_bars) >= MIN_TRAIL_BARS + horizon:
+        src_counts[src] += 1
+        if i % 25 == 0:
+            print(f"  fetch [{i}/{len(fetch_list)}] ... {src_counts}", flush=True)
+    if BENCHMARK_CODE in symbols and bench_bars is not None:
         bars_by_code[BENCHMARK_CODE] = bench_bars
-    print(f"  fetched {len(bars_by_code)}/{len(symbols)} symbols with usable history", flush=True)
+    print(f"  fetched {len(bars_by_code)}/{len(symbols)} symbols  sources={src_counts}", flush=True)
+    if ibkr is not None:
+        try:
+            ibkr.close()
+        except Exception:  # noqa: BLE001
+            pass
     return bars_by_code, bench_bars
 
 
