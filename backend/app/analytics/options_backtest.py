@@ -168,6 +168,10 @@ class Trade:
     # capital at risk per share (the structure's max loss at entry). P&L/share is
     # not comparable across a $60 stock and a $1000 one; P&L / risk is.
     risk_per_share: float | None = None
+    # sum of |leg premium| and leg count -- lets a cost model haircut the trade
+    # by the bid/ask it would really cross (multi-leg structures cost more).
+    gross_premium: float | None = None
+    n_legs: int | None = None
 
 
 @dataclass
@@ -308,6 +312,8 @@ def backtest_symbol(
                 pnl_per_share=round(pnl, 3), win=pnl > 0, regime=regime,
                 managed_pnl=round(m_pnl, 3), exit_reason=reason, days_held=held,
                 risk_per_share=s.max_loss if (s.max_loss or 0) > 0 else None,
+                gross_premium=round(sum(abs(leg.price or 0.0) for leg in s.legs), 3),
+                n_legs=len(s.legs),
             ))
         i += step
     return trades
