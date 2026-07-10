@@ -53,6 +53,7 @@ DEFAULT_VRP = 0.05          # implied trades ~5% over realized on average (vol r
 DEFAULT_HORIZON = 35        # tenor in trading days
 DEFAULT_STEP = 10           # enter a new trade every N trading days (roll cadence)
 MIN_TRAIL_BARS = 260        # need >= this trailing history (GARCH wants ~250)
+GARCH_REFIT_EVERY = 3       # backtest: refit GARCH every N entries, reuse between (see backtest_symbol)
 
 
 @dataclass(frozen=True)
@@ -261,6 +262,8 @@ def backtest_symbol(
     closes = bars["close"].to_numpy()
     idx = bars.index
     i = MIN_TRAIL_BARS
+    entry_no = 0
+    fv_cache: float | None = None   # reused GARCH forecast between refits
     while i + horizon < n:
         trail = bars.iloc[: i + 1]
         spot = float(closes[i])
@@ -278,12 +281,18 @@ def backtest_symbol(
         iv = rv * (1.0 + vrp)
         chain = synth_chain(spot, iv, horizon)
         regime = (regime_map or {}).get(idx[i].date())
+        # GARCH is the per-entry bottleneck but barely moves over `step` days --
+        # refit every GARCH_REFIT_EVERY entries and reuse in between (the live
+        # path still refits every call; this speedup is backtest-only).
+        if entry_no % GARCH_REFIT_EVERY == 0:
+            fv_cache = options_math.forecast_vol_garch(trail, horizon)
+        entry_no += 1
         result = options_engine.build_analysis(
             code=code, name=name, as_of=str(idx[i].date()), spot=spot,
             decision=ta.decision, score=ta.score, bars=trail,
             contracts=chain, expiry=str(idx[i + horizon].date()), dte=horizon,
             holds=False, shares=0.0, confidence=ta.confidence,
-            market_regime=regime,
+            market_regime=regime, forecast_vol_pct=fv_cache if fv_cache is not None else -1.0,
         )
         exit_spot = float(closes[i + horizon])
         path_spots = closes[i + 1 : i + horizon + 1]   # realized daily closes, entry+1..expiry
@@ -347,6 +356,12 @@ def format_report(trades: list[Trade], meta: dict) -> str:
         f"Symbols: {meta['n_symbols']}   Entries: every {meta['step']} trading days   "
         f"Tenor: {meta['horizon']} trading days   VRP: {meta['vrp']:.0%}   "
         f"Regime gate: {'ON' if meta.get('regime') else 'OFF'}",
+        f"Drift bull/bear: {options_engine.DRIFT_BULL_PCT:+.0f}%/{options_engine.DRIFT_BEAR_PCT:+.0f}%   "
+        f"EV gate: {'ON' if options_engine.EV_GATE else 'OFF'}   "
+        f"Bear->credit: {'ON' if options_engine.BEAR_PREFERS_CREDIT else 'OFF'}   "
+        f"Bear-conf: {options_engine.BEAR_DIRECTIONAL_CONFIDENCE:.0%}   "
+        f"Non-S&P: drift {options_engine.DRIFT_BULL_NONSP_PCT:+.0f}%, "
+        f"credit-pref {'ON' if options_engine.NONSP_PREFERS_CREDIT else 'OFF'}",
         f"Modeled IV = trailing Yang-Zhang realized vol x (1+VRP); marks hold-to-expiry.",
         "-" * 78,
     ]
@@ -559,7 +574,28 @@ def main() -> None:
                     help="disable the counter-regime gate")
     ap.add_argument("--ab", action="store_true",
                     help="run gate ON and OFF from one fetch and print an A/B delta")
+    ap.add_argument("--drift-bull", type=float, default=options_engine.DRIFT_BULL_PCT,
+                    help="annualized drift fed to POP/EV in a bull regime (%%)")
+    ap.add_argument("--drift-bear", type=float, default=options_engine.DRIFT_BEAR_PCT,
+                    help="annualized drift fed to POP/EV in a bear regime (%%)")
+    ap.add_argument("--no-ev-gate", action="store_true",
+                    help="disable withholding negative-model-EV structures")
+    ap.add_argument("--no-bear-credit", action="store_true",
+                    help="disable the bear-regime preference for credit structures")
+    ap.add_argument("--bear-conf", type=float, default=options_engine.BEAR_DIRECTIONAL_CONFIDENCE,
+                    help="confidence needed for a directional bearish trade in a bear tape (0 disables)")
+    ap.add_argument("--drift-nonsp", type=float, default=options_engine.DRIFT_BULL_NONSP_PCT,
+                    help="bull-regime drift for non-S&P names (%%; size preset)")
+    ap.add_argument("--no-nonsp-credit", action="store_true",
+                    help="disable the non-S&P preference for credit structures")
     args = ap.parse_args()
+    options_engine.DRIFT_BULL_PCT = args.drift_bull
+    options_engine.DRIFT_BEAR_PCT = args.drift_bear
+    options_engine.EV_GATE = not args.no_ev_gate
+    options_engine.BEAR_PREFERS_CREDIT = not args.no_bear_credit
+    options_engine.BEAR_DIRECTIONAL_CONFIDENCE = args.bear_conf
+    options_engine.DRIFT_BULL_NONSP_PCT = args.drift_nonsp
+    options_engine.NONSP_PREFERS_CREDIT = not args.no_nonsp_credit
     # Windows consoles default to cp1252, which can't encode non-ASCII; force
     # UTF-8 so the report (and any stray unicode) never crashes the final print.
     try:

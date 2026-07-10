@@ -41,8 +41,68 @@ LOW_CONFIDENCE_THRESHOLD = 0.45   # technical confidence below this -> direction
 # holders (collar) are exempt, protection is never gated away.
 REGIME_SMA = 200                  # benchmark close vs its 200-day SMA: the boring classic
 REGIME_OVERRIDE_CONFIDENCE = 0.60 # confidence needed to trade AGAINST the regime
+
+# --- drift-aware POP/EV -------------------------------------------------------
+# Annualized expected-return assumption fed into the POP/EV lognormal, by
+# market regime. Zero-drift POP proved regime-blind in the 6y backtest
+# (predicted POP flat across regimes while actual win rates swung ~18pts).
+# DRIFT_BEAR_PCT defaults to 0, not negative: the 200-SMA regime label LAGS,
+# so bear-labeled windows contain recoveries -- forward 35d drift in them was
+# ~flat, and long-put structures still underperformed their predicted POP.
+DRIFT_BULL_PCT = 8.0
+DRIFT_BEAR_PCT = 0.0
+
+# --- size preset (the user's S&P-vs-not split; deliberately just TWO presets,
+# no per-sector tuning -- one more cut and it's curve fitting) -----------------
+# Non-S&P names don't grind upward like mega-caps: at drift 8 the backtest's
+# smallcap Call Debit bucket ran -8.8% ret/risk with an overconfident POP;
+# at drift 3 the POP was honest (pred 37.9 vs actual 35.7) and overall
+# ret/risk doubled. Membership is by the bundled S&P list; unknown = non-S&P.
+DRIFT_BULL_NONSP_PCT = 3.0
+# Non-S&P bullish reads favour selling premium even at Normal IV: smallcap
+# CSP made +27.9% ret/risk where Call Debit lost -6.0% (same entries, same
+# tape) -- richer small-cap premium for the same directional view.
+NONSP_PREFERS_CREDIT = True
+
+# Withhold non-protective structures whose model EV is negative at the offered
+# prices/drift (protection -- Collar, Covered Call -- is never gated away).
+EV_GATE = True
+
+# In a bear regime, a bearish read gets a defined-risk CREDIT structure even
+# when IV isn't Elevated: the backtest's bear-regime bucket showed long-premium
+# put debit spreads at -23% return-on-risk while credit structures made money.
+BEAR_PREFERS_CREDIT = True
+
+# WITH-regime bearish reads in a bear tape route to neutral below this
+# confidence (see the bear-tape gate in build_analysis). Above 1.0 = route ALL
+# of them: the 6y backtest showed even high-conviction (>=60%) bearish trades
+# in a bear tape lost -23% ret/risk -- conviction was ANTI-predictive there
+# (the strongest downtrends snap back hardest), while neutral structures made
+# +11-27% in the same windows. Set to 0 to disable the gate entirely.
+BEAR_DIRECTIONAL_CONFIDENCE = 1.01
 SKEW_NOTE_THRESHOLD_PTS = 3.0     # |25d put IV - 25d call IV| above this earns a skew note
 TERM_NOTE_THRESHOLD_PTS = 2.0     # front-vs-next ATM IV gap above this earns a term note
+
+
+_SP500_CODES: set[str] | None = None
+
+
+def is_sp500(code: str) -> bool:
+    """S&P-membership check against the bundled constituents list (lazy-loaded
+    once). Drives the two-preset size split; a code not in the list -- or a
+    missing list -- is treated as non-S&P. ponytail: the bundled file is a
+    snapshot, not a live index feed; refresh it when constituents change."""
+    global _SP500_CODES
+    if _SP500_CODES is None:
+        try:
+            from app.ml.universe import SP500_FILE
+            _SP500_CODES = {
+                ln.strip().upper() for ln in SP500_FILE.read_text().splitlines()
+                if ln.strip() and not ln.startswith("#")
+            }
+        except Exception:  # noqa: BLE001 - missing/unreadable list -> everyone non-S&P
+            _SP500_CODES = set()
+    return code.upper() in _SP500_CODES
 
 
 def _realized_vol_close_close(close: pd.Series, window: int = 30) -> float | None:
@@ -150,6 +210,7 @@ def build_analysis(
     next_atm_iv_pct: float | None = None,
     next_expiry: str | None = None,
     market_regime: str | None = None,   # "bull" | "bear" | None=unknown (see benchmark_regime)
+    forecast_vol_pct: float | None = None,   # precomputed GARCH forecast; skip the (costly) refit if given
 ) -> OptionsAnalysis:
     out = OptionsAnalysis(
         code=code, name=name, as_of=as_of, spot=spot,
@@ -188,7 +249,13 @@ def build_analysis(
     # statistically correct baseline: implied vol prices variance over the
     # contract's life, so 'rich/cheap' should be IV vs forward vol for that
     # horizon, not vs what already happened. Falls back to realized on any miss.
-    fv = options_math.forecast_vol_garch(bars, dte)
+    # A caller mid-backtest can pass a precomputed forecast (the GARCH fit barely
+    # moves over a few days but is the per-entry bottleneck) -- refit only when
+    # not supplied. A non-positive value means "known no-forecast, don't refit".
+    if forecast_vol_pct is not None:
+        fv = forecast_vol_pct if forecast_vol_pct > 0 else None
+    else:
+        fv = options_math.forecast_vol_garch(bars, dte)
     out.forecast_vol_pct = round(fv, 1) if fv else None
     baseline = fv if (fv and fv > 0) else rv
     out.iv_regime_basis = "garch_forecast" if (fv and fv > 0) else "realized"
@@ -227,9 +294,25 @@ def build_analysis(
             f"⚖ Counter-regime trade: this {bias} read fights a {market_regime} market — "
             f"kept because conviction is high ({confidence:.0%}), but size accordingly."
         )
+    elif (bias == "bearish" and market_regime == "bear"
+          and (confidence is None or confidence < BEAR_DIRECTIONAL_CONFIDENCE)):
+        # WITH-regime bearish is not safe either: the 200-SMA bear label LAGS,
+        # so bear-labeled windows are full of rallies -- every directional
+        # bearish structure lost in the 6y backtest (put debit -23%, bear call
+        # -13% ret/risk) while neutral structures made money there (condor
+        # +16%, straddle +8%). Only a high-conviction bearish read earns a
+        # directional trade in a bear tape; the rest route to neutral.
+        bias = "neutral"
+        out.notes.append(
+            f"⚖ Bear-tape gate: bearish reads in a bear market need high conviction "
+            f"(the regime label lags and bear rallies are violent)"
+            + (f" ({confidence:.0%} < {BEAR_DIRECTIONAL_CONFIDENCE:.0%})" if confidence is not None else "")
+            + " — neutral structures shown instead."
+        )
 
     iv_high = out.iv_regime == "Elevated"
     iv_low = out.iv_regime == "Cheap"
+    large_cap = is_sp500(code)   # size preset: S&P members vs everything else
 
     # Low technical conviction -> don't pretend the directional read is solid:
     # flag it, and ALSO offer neutral structures alongside the directional ones.
@@ -373,7 +456,9 @@ def build_analysis(
 
     # --- Bullish ---
     if bias == "bullish":
-        if iv_high:
+        # Non-S&P names: sell premium even at Normal IV (see NONSP_PREFERS_CREDIT)
+        # -- their richer premium beat directional call debits in every backtest cut.
+        if iv_high or (NONSP_PREFERS_CREDIT and not large_cap):
             short = _by_delta(puts, TARGET_DELTA)
             long = _by_delta(puts, WING_DELTA)
             if short is not None and long is not None and long["strike"] < short["strike"] \
@@ -390,7 +475,9 @@ def build_analysis(
                     max_loss=round(width - credit, 2),
                     breakeven=round(short["strike"] - credit, 2),
                     rationale=(
-                        f"IV is elevated, so selling premium is favoured. Sell the {short['strike']:.0f} "
+                        (f"IV is elevated, so selling premium is favoured. " if iv_high else
+                         f"Off-index name — premium runs rich relative to realized moves, so selling beats buying direction. ")
+                        + f"Sell the {short['strike']:.0f} "
                         f"put and buy the {long['strike']:.0f} put for ~${credit:.2f} credit. You profit "
                         f"if {name} stays above {short['strike']:.0f}; risk is capped."
                     ),
@@ -440,7 +527,10 @@ def build_analysis(
 
     # --- Bearish ---
     if bias == "bearish":
-        if iv_high:
+        # In a bear regime the credit structure wins even at normal IV (see
+        # BEAR_PREFERS_CREDIT) -- long-premium put debits fought theta AND the
+        # bear-rally chop and lost in every backtest cut.
+        if iv_high or (BEAR_PREFERS_CREDIT and market_regime == "bear"):
             short = _by_delta(calls, TARGET_DELTA)
             long = _by_delta(calls, WING_DELTA)
             if short is not None and long is not None and long["strike"] > short["strike"] \
@@ -457,7 +547,9 @@ def build_analysis(
                     max_loss=round(width - credit, 2),
                     breakeven=round(short["strike"] + credit, 2),
                     rationale=(
-                        f"IV is elevated — sell premium. Sell the {short['strike']:.0f} call and buy the "
+                        (f"IV is elevated — sell premium. " if iv_high else
+                         f"Bear-market tape — defined-risk credit beats paying theta for downside. ")
+                        + f"Sell the {short['strike']:.0f} call and buy the "
                         f"{long['strike']:.0f} call for ~${credit:.2f} credit. Profit if {name} stays below "
                         f"{short['strike']:.0f}; risk capped."
                     ),
@@ -566,11 +658,28 @@ def build_analysis(
 
     # Attach profit-taking / stop / roll management, net Greeks, probability of
     # profit, event/liquidity warnings, and risk-budgeted sizing to every structure.
+    bull_drift = DRIFT_BULL_PCT if large_cap else DRIFT_BULL_NONSP_PCT
+    drift_pct = (bull_drift if market_regime == "bull"
+                 else DRIFT_BEAR_PCT if market_regime == "bear" else 0.0)
     for s in strategies:
         _attach_management(s, dte)
-        _attach_risk_metrics(s, spot, dte, out.atm_iv_pct)
+        _attach_risk_metrics(s, spot, dte, out.atm_iv_pct, drift_pct)
         _attach_warnings(s, earnings_within_tenor, out.earnings_date, days_to_earnings)
         _attach_sizing(s, shares, book_value_usd, risk_budget_frac)
+
+    # EV gate: a structure with negative model EV at these prices/drift is a
+    # trade the numbers say not to take -- withhold it. Protection is exempt
+    # (same principle as the regime gate: never gate a hedge away).
+    if EV_GATE:
+        gated = [s.name for s in strategies
+                 if s.name not in _STOCK_INCLUSIVE_NAMES
+                 and s.ev_per_share is not None and s.ev_per_share < 0]
+        if gated:
+            strategies = [s for s in strategies if s.name not in gated]
+            out.notes.append(
+                f"EV gate: withheld {', '.join(gated)} — negative model expected value "
+                f"at the offered premiums (drift {drift_pct:+.0f}%/yr, {market_regime or 'unknown'} regime)."
+            )
 
     if not strategies:
         out.notes.append(
@@ -639,7 +748,10 @@ def _attach_management(s: OptionStrategy, dte: int) -> None:
                     f"(gamma decay) — close or roll by ~{roll_dte} DTE.")
 
 
-def _attach_risk_metrics(s: OptionStrategy, spot: float, dte: int, atm_iv_pct: float | None) -> None:
+def _attach_risk_metrics(
+    s: OptionStrategy, spot: float, dte: int, atm_iv_pct: float | None,
+    drift_pct: float = 0.0,
+) -> None:
     """Fill net position Greeks (native BSM -- the broker only supplies a
     per-leg delta, nothing else), probability of profit, and expected value
     per share (both from the generic payoff-curve engine, so they work for any
@@ -679,10 +791,10 @@ def _attach_risk_metrics(s: OptionStrategy, spot: float, dte: int, atm_iv_pct: f
     if includes_stock:
         payoff = payoff + (grid - spot)   # long stock P&L per share
     tenor = s.tenor_dte or dte
-    pop = options_math.probability_of_profit(spot, atm_iv_pct, tenor, payoff, grid)
+    pop = options_math.probability_of_profit(spot, atm_iv_pct, tenor, payoff, grid, drift_pct)
     if pop is not None:
         s.pop_pct = round(pop, 1)
-    ev = options_math.expected_pnl(spot, atm_iv_pct, tenor, payoff, grid)
+    ev = options_math.expected_pnl(spot, atm_iv_pct, tenor, payoff, grid, drift_pct)
     if ev is not None:
         s.ev_per_share = round(ev, 2)
 
