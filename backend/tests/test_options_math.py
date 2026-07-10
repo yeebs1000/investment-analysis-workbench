@@ -16,6 +16,11 @@ from app.analytics import options as opt
 from app.analytics import options_math as om
 from app.data.models import Decision, OptionLeg
 
+# Structure-construction tests use arbitrary fixture premiums (not fair value),
+# so the EV *selection* gate would veto legitimately-built structures. Off by
+# default here; the gate has its own dedicated test that flips it back on.
+opt.EV_GATE = False
+
 
 def _approx(a, b, tol=1e-6):
     return abs(float(a) - float(b)) <= tol
@@ -232,10 +237,11 @@ def test_regime_gate_respects_high_conviction():
 
 
 def test_regime_gate_inactive_when_aligned_or_unknown():
-    # bearish read in a BEAR market: no gate, structures kept
-    aligned = _build_bearish(confidence=0.40, market_regime="bear")
-    assert any(s.direction == "Bearish" for s in aligned.strategies)
-    # unknown regime: gate can't fire
+    # bearish read in a BEAR market: the counter-regime gate doesn't fire, but
+    # the bear-tape gate routes ALL bearish reads to neutral by default.
+    aligned = _build_bearish(confidence=0.80, market_regime="bear")
+    assert all(s.direction != "Bearish" for s in aligned.strategies)
+    # unknown regime: neither gate can fire
     unknown = _build_bearish(confidence=0.40, market_regime=None)
     assert any(s.direction == "Bearish" for s in unknown.strategies)
 
@@ -531,6 +537,90 @@ def test_skew_computed():
     # synthetic contracts use a flat IV, so skew should be ~0 (both wings equal)
     assert result.skew_25d_pts is not None
     assert _approx(result.skew_25d_pts, 0.0, tol=0.5)
+
+
+def test_drift_shifts_pop_and_ev_directionally():
+    # A long ATM call's POP/EV must rise with positive drift and fall with
+    # negative drift; zero drift must reproduce the legacy default.
+    spot, iv, dte = 100.0, 30.0, 35
+    grid = om.default_price_grid(spot)
+    legs = [OptionLeg(action="Buy", right="Call", strike=100.0, expiry="x", dte=dte, price=3.0)]
+    payoff = om.payoff_at_expiry(legs, grid)
+    pop0 = om.probability_of_profit(spot, iv, dte, payoff, grid)
+    pop_up = om.probability_of_profit(spot, iv, dte, payoff, grid, drift_pct=8.0)
+    pop_dn = om.probability_of_profit(spot, iv, dte, payoff, grid, drift_pct=-8.0)
+    assert pop_dn < pop0 < pop_up, (pop_dn, pop0, pop_up)
+    assert om.probability_of_profit(spot, iv, dte, payoff, grid, drift_pct=0.0) == pop0
+    ev_up = om.expected_pnl(spot, iv, dte, payoff, grid, drift_pct=8.0)
+    ev_dn = om.expected_pnl(spot, iv, dte, payoff, grid, drift_pct=-8.0)
+    assert ev_dn < ev_up
+
+
+def test_ev_gate_withholds_negative_ev_structures():
+    # With the gate on, every offered non-protective structure has EV >= 0,
+    # and turning it off can only widen (never shrink) the offer list.
+    spot = 100.0
+    bars = _simulate_ohlc_from_path(n_days=120, seed=1, daily_vol=0.01)
+    contracts = _synthetic_contracts(spot, iv_pct=60.0, dte=30)
+    kw = dict(code="TEST", name="Test Co", as_of=None, spot=spot,
+              decision=Decision.BUY, score=70.0, bars=bars, contracts=contracts,
+              expiry="2099-01-01", dte=30, holds=False, shares=0.0, confidence=0.8)
+    old = opt.EV_GATE
+    try:
+        opt.EV_GATE = True
+        gated = opt.build_analysis(**kw)
+        for s in gated.strategies:
+            if s.name not in opt._STOCK_INCLUSIVE_NAMES and s.ev_per_share is not None:
+                assert s.ev_per_share >= 0, f"{s.name} offered with EV {s.ev_per_share}"
+        opt.EV_GATE = False
+        ungated = opt.build_analysis(**kw)
+        assert len(ungated.strategies) >= len(gated.strategies)
+    finally:
+        opt.EV_GATE = old
+
+
+def test_bear_tape_gate_routes_bearish_to_neutral():
+    # Default (>1.0): ALL bear-tape bearish reads route to neutral, even high
+    # conviction. Lowered to 0.60, a high-conviction read keeps its direction.
+    spot = 100.0
+    bars = _simulate_ohlc_from_path(n_days=120, seed=1, daily_vol=0.01)
+    contracts = _synthetic_contracts(spot, iv_pct=60.0, dte=30)
+    kw = dict(code="TEST", name="Test Co", as_of=None, spot=spot,
+              decision=Decision.SELL, score=30.0, bars=bars, contracts=contracts,
+              expiry="2099-01-01", dte=30, holds=False, shares=0.0,
+              market_regime="bear")
+    low = opt.build_analysis(**kw, confidence=0.40)
+    assert all(s.direction != "Bearish" for s in low.strategies), \
+        [s.name for s in low.strategies]
+    high = opt.build_analysis(**kw, confidence=0.80)
+    assert all(s.direction != "Bearish" for s in high.strategies), \
+        [s.name for s in high.strategies]
+    old = opt.BEAR_DIRECTIONAL_CONFIDENCE
+    try:
+        opt.BEAR_DIRECTIONAL_CONFIDENCE = 0.60
+        high2 = opt.build_analysis(**kw, confidence=0.80)
+        assert any(s.direction == "Bearish" for s in high2.strategies), \
+            [s.name for s in high2.strategies]
+    finally:
+        opt.BEAR_DIRECTIONAL_CONFIDENCE = old
+
+
+def test_size_preset_membership_and_credit_preference():
+    # Membership: a real constituent is large-cap, a made-up code is not.
+    assert opt.is_sp500("US.AAPL")
+    assert not opt.is_sp500("US.ZZZFAKE")
+    # A bullish non-S&P read at NORMAL IV gets credit structures (CSP/bull put),
+    # not a call debit spread; the same read on an S&P name keeps the debit.
+    spot = 100.0
+    bars = _simulate_ohlc_from_path(n_days=120, seed=2, daily_vol=0.01)
+    contracts = _synthetic_contracts(spot, iv_pct=60.0, dte=30)
+    kw = dict(name="Test Co", as_of=None, spot=spot,
+              decision=Decision.BUY, score=70.0, bars=bars, contracts=contracts,
+              expiry="2099-01-01", dte=30, holds=False, shares=0.0, confidence=0.8)
+    small = opt.build_analysis(code="US.ZZZFAKE", **kw)
+    small_names = {s.name for s in small.strategies}
+    assert "Call Debit Spread" not in small_names, small_names
+    assert {"Cash-Secured Put", "Bull Put Spread (credit)"} & small_names, small_names
 
 
 def main():

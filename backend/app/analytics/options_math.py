@@ -246,20 +246,24 @@ def payoff_at_expiry(legs: list, price_grid: np.ndarray) -> np.ndarray:
 
 def _terminal_masses(
     spot: float, iv_pct: float | None, dte: int | None, price_grid: np.ndarray,
+    drift_pct: float = 0.0,
 ) -> np.ndarray | None:
-    """Probability mass per grid bin under a zero-drift lognormal terminal
-    price distribution (ln(S_T/S0) ~ N(-0.5*sigma^2*T, sigma^2*T)) at the
-    given ATM implied vol -- the standard retail-platform convention absent a
-    reliable risk-free-rate/dividend pipeline. Bin i covers (-inf, grid[0])
-    for i=0, [grid[i-1], grid[i]) for interior bins, [grid[-1], inf) for the
-    last -- so the result has len(grid)+1 entries summing to 1."""
+    """Probability mass per grid bin under a lognormal terminal price
+    distribution (ln(S_T/S0) ~ N((drift-0.5*sigma^2)*T, sigma^2*T)) at the
+    given ATM implied vol. `drift_pct` is an annualized expected-return
+    assumption; 0 keeps the standard zero-drift retail convention. The 6y
+    backtest showed zero-drift POP is regime-blind (predicted POP identical in
+    bull and bear while actual win rates swung ~18pts), so callers may pass a
+    regime-conditional drift. Bin i covers (-inf, grid[0]) for i=0,
+    [grid[i-1], grid[i]) for interior bins, [grid[-1], inf) for the last --
+    so the result has len(grid)+1 entries summing to 1."""
     if spot is None or spot <= 0 or iv_pct is None or iv_pct <= 0 or dte is None or dte <= 0:
         return None
     if len(price_grid) < 2:
         return None
     sigma = iv_pct / 100.0
     t = dte / 365.0
-    mu = -0.5 * sigma ** 2 * t
+    mu = (drift_pct / 100.0 - 0.5 * sigma ** 2) * t
     with np.errstate(divide="ignore"):
         d = (np.log(price_grid / spot) - mu) / (sigma * np.sqrt(t))
     cdf = norm.cdf(d)
@@ -269,11 +273,12 @@ def _terminal_masses(
 
 def probability_of_profit(
     spot: float, iv_pct: float | None, dte: int | None, payoff: np.ndarray, price_grid: np.ndarray,
+    drift_pct: float = 0.0,
 ) -> float | None:
     """Probability the position is profitable at expiry (see _terminal_masses
     for the distributional assumption). An approximation, not a precise
     probability; treat it as directional."""
-    masses = _terminal_masses(spot, iv_pct, dte, price_grid)
+    masses = _terminal_masses(spot, iv_pct, dte, price_grid, drift_pct)
     if masses is None or len(payoff) != len(price_grid):
         return None
 
@@ -290,15 +295,16 @@ def probability_of_profit(
 
 def expected_pnl(
     spot: float, iv_pct: float | None, dte: int | None, payoff: np.ndarray, price_grid: np.ndarray,
+    drift_pct: float = 0.0,
 ) -> float | None:
-    """Probability-weighted P&L per share at expiry under the same zero-drift
-    lognormal used for POP. This is the principled companion to POP: a
-    high-POP structure can still be negative-EV (small frequent wins, rare
-    large losses), and vice versa. Under this flat-vol model, deviations from
-    zero mostly reflect market skew/mid-pricing vs the model -- directional,
-    not precise. Tail bins beyond the grid use the edge payoff (understates
-    unbounded wings slightly)."""
-    masses = _terminal_masses(spot, iv_pct, dte, price_grid)
+    """Probability-weighted P&L per share at expiry under the same lognormal
+    used for POP (drift_pct=0 -> zero-drift). This is the principled companion
+    to POP: a high-POP structure can still be negative-EV (small frequent
+    wins, rare large losses), and vice versa. Under this flat-vol model,
+    deviations from zero mostly reflect market skew/mid-pricing vs the model
+    -- directional, not precise. Tail bins beyond the grid use the edge payoff
+    (understates unbounded wings slightly)."""
+    masses = _terminal_masses(spot, iv_pct, dte, price_grid, drift_pct)
     if masses is None or len(payoff) != len(price_grid):
         return None
     bin_payoff = np.empty(len(masses), dtype=float)

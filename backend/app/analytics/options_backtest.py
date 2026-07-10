@@ -356,6 +356,12 @@ def format_report(trades: list[Trade], meta: dict) -> str:
         f"Symbols: {meta['n_symbols']}   Entries: every {meta['step']} trading days   "
         f"Tenor: {meta['horizon']} trading days   VRP: {meta['vrp']:.0%}   "
         f"Regime gate: {'ON' if meta.get('regime') else 'OFF'}",
+        f"Drift bull/bear: {options_engine.DRIFT_BULL_PCT:+.0f}%/{options_engine.DRIFT_BEAR_PCT:+.0f}%   "
+        f"EV gate: {'ON' if options_engine.EV_GATE else 'OFF'}   "
+        f"Bear->credit: {'ON' if options_engine.BEAR_PREFERS_CREDIT else 'OFF'}   "
+        f"Bear-conf: {options_engine.BEAR_DIRECTIONAL_CONFIDENCE:.0%}   "
+        f"Non-S&P: drift {options_engine.DRIFT_BULL_NONSP_PCT:+.0f}%, "
+        f"credit-pref {'ON' if options_engine.NONSP_PREFERS_CREDIT else 'OFF'}",
         f"Modeled IV = trailing Yang-Zhang realized vol x (1+VRP); marks hold-to-expiry.",
         "-" * 78,
     ]
@@ -568,7 +574,28 @@ def main() -> None:
                     help="disable the counter-regime gate")
     ap.add_argument("--ab", action="store_true",
                     help="run gate ON and OFF from one fetch and print an A/B delta")
+    ap.add_argument("--drift-bull", type=float, default=options_engine.DRIFT_BULL_PCT,
+                    help="annualized drift fed to POP/EV in a bull regime (%%)")
+    ap.add_argument("--drift-bear", type=float, default=options_engine.DRIFT_BEAR_PCT,
+                    help="annualized drift fed to POP/EV in a bear regime (%%)")
+    ap.add_argument("--no-ev-gate", action="store_true",
+                    help="disable withholding negative-model-EV structures")
+    ap.add_argument("--no-bear-credit", action="store_true",
+                    help="disable the bear-regime preference for credit structures")
+    ap.add_argument("--bear-conf", type=float, default=options_engine.BEAR_DIRECTIONAL_CONFIDENCE,
+                    help="confidence needed for a directional bearish trade in a bear tape (0 disables)")
+    ap.add_argument("--drift-nonsp", type=float, default=options_engine.DRIFT_BULL_NONSP_PCT,
+                    help="bull-regime drift for non-S&P names (%%; size preset)")
+    ap.add_argument("--no-nonsp-credit", action="store_true",
+                    help="disable the non-S&P preference for credit structures")
     args = ap.parse_args()
+    options_engine.DRIFT_BULL_PCT = args.drift_bull
+    options_engine.DRIFT_BEAR_PCT = args.drift_bear
+    options_engine.EV_GATE = not args.no_ev_gate
+    options_engine.BEAR_PREFERS_CREDIT = not args.no_bear_credit
+    options_engine.BEAR_DIRECTIONAL_CONFIDENCE = args.bear_conf
+    options_engine.DRIFT_BULL_NONSP_PCT = args.drift_nonsp
+    options_engine.NONSP_PREFERS_CREDIT = not args.no_nonsp_credit
     # Windows consoles default to cp1252, which can't encode non-ASCII; force
     # UTF-8 so the report (and any stray unicode) never crashes the final print.
     try:
