@@ -215,7 +215,7 @@
   <div class="verdict">
     <div class="verdict-head">
       <h2 class="serif">Headline result</h2>
-      <span class="badge"><span class="dot"></span> 10-gate validation: 7 pass · 1 marginal · 1 flag · 1 pending</span>
+      <span class="badge"><span class="dot"></span> Post-review: real structural alpha · tail-event profile · VRP-dependent</span>
     </div>
     <div class="stat-row">
       <div>
@@ -370,20 +370,36 @@
     <p class="sec-note">A professional-grade gate list (walk-forward, baselines, plateaus, robustness, drawdown) run against the tuned strategy. Every gate that <em>can</em> be tested on synthetic data has been; what remains needs real quotes and time.</p>
     <div class="tbl-scroll">
       <table>
-        <thead><tr><th>Acceptance gate</th><th>Result</th><th>Verdict</th></tr></thead>
+        <thead><tr><th>Acceptance gate</th><th>Result (after external-review fixes)</th><th>Verdict</th></tr></thead>
         <tbody>
-          <tr><td>OOS expectancy positive</td><td style="text-align:left">OOS +22.8% gross; ~+11.5% at 5% slip</td><td><span class="chip p">PASS</span></td></tr>
-          <tr><td>Lower confidence bound &gt; 0</td><td style="text-align:left">Bootstrap CI [+19.2%, +24.1%]</td><td><span class="chip p">PASS</span></td></tr>
-          <tr><td>Survives 2× costs</td><td style="text-align:left">Breakeven at ~11% round-trip slip</td><td><span class="chip" style="background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)">MARGINAL</span></td></tr>
-          <tr><td>Parameter plateaus, not cliffs</td><td style="text-align:left">All 6 neighbors +20.1–23.4%</td><td><span class="chip p">PASS</span></td></tr>
-          <tr><td>No single year / symbol dominates</td><td style="text-align:left">Max year 31%, top symbol 1.9% — but Long Straddle 48.5% of P&amp;L</td><td><span class="chip" style="background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)">FLAG</span></td></tr>
-          <tr><td>OOS retains ≥ ~50%</td><td style="text-align:left"><b>110%</b> (S&amp;P), 87% (small-cap)</td><td><span class="chip p">PASS</span></td></tr>
-          <tr><td>Drawdown fits risk budget</td><td style="text-align:left">MDD ≈ 2.2–2.8× total risk cap; 385 days underwater</td><td><span class="chip p">MEASURED</span></td></tr>
-          <tr><td>Beats the simple baseline</td><td style="text-align:left">3× the alpha at 40% of the beta (see below)</td><td><span class="chip p">PASS</span></td></tr>
-          <tr><td>Not merely equity beta</td><td style="text-align:left">+14.6pt alpha vs +7.1pt β×market</td><td><span class="chip p">PASS</span></td></tr>
-          <tr><td>Paper fills ≈ modeled fills</td><td style="text-align:left">Chain recorder live (109 symbols daily); needs months</td><td><span class="chip" style="background:var(--accent-soft);color:var(--accent)">PENDING</span></td></tr>
+          <tr><td>Expectancy positive (validation window)</td><td style="text-align:left">2024–26 is <em>validation</em>, not test — all rules built with the full window visible. Net +12.8% there; true OOS starts at the recorder clock</td><td><span class="chip" style="background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)">RELABELED</span></td></tr>
+          <tr><td>Lower confidence bound &gt; 0</td><td style="text-align:left">2024+ only, <b>net of costs</b>, entry-date-cohort bootstrap: mean +12.8%, CI <b>[+6.1%, +19.9%]</b></td><td><span class="chip p">PASS</span></td></tr>
+          <tr><td>Survives 2× costs</td><td style="text-align:left">Breakeven at ~11% round-trip slip; +11.5% at 5%</td><td><span class="chip" style="background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)">MARGINAL</span></td></tr>
+          <tr><td>Parameter plateaus, not cliffs</td><td style="text-align:left">Full 3×3 DTE×delta joint grid: all 9 cells +19.5–25.5% in both windows, smooth gradients</td><td><span class="chip p">PASS</span></td></tr>
+          <tr><td>No concentration</td><td style="text-align:left">Straddles 48.5% of P&amp;L; <b>without best 5% of trades: +0.01%</b> — a tail-event strategy, size it as one</td><td><span class="chip n">TAIL-EVENT</span></td></tr>
+          <tr><td>Retention across windows</td><td style="text-align:left">110% (S&amp;P), 87% (small-cap) — but can't detect pricing bias shared by both windows</td><td><span class="chip p">PASS*</span></td></tr>
+          <tr><td>Drawdown fits risk budget</td><td style="text-align:left"><b>Daily-marked MDD −21.2%</b> at 5% risk cap (1.6× the expiry-mark figure); 388 days underwater</td><td><span class="chip p">MEASURED</span></td></tr>
+          <tr><td>Beats baselines (incl. permuted signals)</td><td style="text-align:left">Beats blind condor and buy-and-hold; <b>ties permuted-signals</b> — see identity finding below</td><td><span class="chip" style="background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)">REFRAMED</span></td></tr>
+          <tr><td>Not merely equity beta</td><td style="text-align:left">Daily HAC regression: <b>alpha +12.2 bps/day (+31%/yr gross), t=2.99</b>; market beta 0.50</td><td><span class="chip p">PASS</span></td></tr>
+          <tr><td>Paper fills ≈ modeled fills</td><td style="text-align:left">Recorder (109 symbols) + daily signal log (legs vs bid/ask/mid/theo) both live; needs months</td><td><span class="chip" style="background:var(--accent-soft);color:var(--accent)">PENDING</span></td></tr>
         </tbody>
       </table>
+    </div>
+
+    <h3 class="sec serif" style="margin-top:2.2rem">The identity finding: the signal is a passenger</h3>
+    <p class="sec-note">The decisive test of the review round: rerun the entire backtest with each symbol's technical decisions <em>shuffled across its own entry dates</em> — same chains, same gates, same mechanics, destroyed signal. The result is indistinguishable from the real run.</p>
+    <div class="tbl-scroll">
+      <table>
+        <thead><tr><th></th><th>Mean R</th><th>PF</th><th>Win %</th></tr></thead>
+        <tbody>
+          <tr><td>Real technical signals</td><td class="cell-num">+21.7%</td><td class="cell-num">1.62</td><td class="cell-num">52.6%</td></tr>
+          <tr class="total"><td>Randomly permuted signals</td><td class="cell-num">+21.67%</td><td class="cell-num">1.63</td><td class="cell-num">52.4%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="caption">Corroborated by the ranking test: POP deciles rank outcomes cleanly end-to-end (pred 38→65% maps to actual 45→75%, strictly monotone), but <em>within-structure</em> ranking ICs are ~0.02–0.05 — negligible. The strategist's real skill is coarse: vol-regime structure routing and the gates. The directional technical layer adds ≈ nothing to aggregate P&amp;L.</p>
+    <div class="callout">
+      <strong>What this strategy actually is:</strong> a mechanical <b>long-volatility / VRP tail-harvester</b> with regime and EV gating. Its P&amp;L level rides on the volatility-risk-premium assumption (blind ATM straddles earn +19% at the assumed IV = 1.05× realized, break even at 1.25×, lose at 1.40×) — and the first real-quote reading (25 names, day one of the recorder) measured <b>median actual VRP ≈ 0.99</b>: the market currently sells that convexity <em>cheaper</em> than the backtest assumed. Weeks of recorder data will settle the strategy's single load-bearing assumption.
     </div>
 
     <h3 class="sec serif" style="margin-top:2.2rem">Walk-forward: does the edge survive out-of-sample?</h3>
@@ -419,7 +435,7 @@
       <li><b>Cost stress:</b> at 2.5% round-trip slippage PF 1.42 / +16.0%; at 5% PF 1.29 / +11.5%; breakeven ≈ 11%; at 15% the strategy loses. The edge survives realistic costs but not sloppy execution — liquid, tight-spread underlyings only.</li>
       <li><b>Parameter plateau:</b> every neighbor of the tuned point (drift 4/12, delta .25/.35, DTE 25/45) earns +20.1% to +23.4% — a smooth plateau, no curve-fit cliff. DTE 45 tested mildly better; left alone on the plateau principle.</li>
       <li><b>Robustness:</b> no year supplies more than 31% of P&amp;L, top symbol 1.9%, top five 9.0%. Honest flags: Long Straddle contributes 48.5% of P&amp;L and the top 5% of trades supply 55% — a long-vol, tail-driven profit engine that deserves its own ask-side-fill validation before real money.</li>
-      <li><b>Drawdown (scale-invariant):</b> max drawdown ≈ 2.2–2.8× the standing total-risk cap; longest underwater stretch <b>385 days at any size</b>; 26% of months negative. At a 5% total-risk cap: −13.5% MDD, Calmar ~3.4, ~+22% CAGR after realistic slippage. Marks at expiry only, so true intra-trade MDD is deeper.</li>
+      <li><b>Drawdown (daily marks, per review):</b> marking every open position daily deepens MDD to <b>−21.2%</b> at the 5% risk cap (the expiry-mark −13.5% was a floor, as suspected); 388 days underwater; daily-marked portfolio Sharpe 1.47 gross ≈ 0.8 after realistic costs.</li>
       <li><b>Honest portfolio Sharpe:</b> 0.57 on non-overlapping cohorts (the 1.47 overlapping figure is the optimistic bound).</li>
     </ul>
   </section>
@@ -474,7 +490,7 @@
   <!-- BOTTOM LINE -->
   <section>
     <h3 class="sec serif">Bottom line</h3>
-    <p class="sec-note" style="max-width:68ch">The selection logic is validated <b>as far as synthetic data can take it</b>: out-of-sample (110% retention), against baselines (3× the alpha at 40% of the beta), across parameter neighborhoods (plateau, no cliff), net of modeled costs (survives 5% slippage), and decomposed from market beta. Seven of ten acceptance gates pass; none fail. The honest expectation is a <b>modest, real edge</b> — portfolio Sharpe ~0.6, a quarter of months negative, year-long underwater stretches — not a money printer. What remains is exactly what no simulation can supply: months of real quotes (now recording daily, 109 symbols), a paper-fill comparison, and a pilot sized so the worst case costs ~0.2% of capital. Nothing left to compute; from here, only real quotes and time raise confidence.</p>
+    <p class="sec-note" style="max-width:68ch">After a full external-review round, the honest identity is settled: this is a <b>mechanical long-volatility harvester</b> — disciplined structure routing off the vol regime, hard gates, and cheap convexity — whose alpha is real (+12.2 bps/day, t=2.99, on daily marks) but <em>structural</em>, not predictive: permuting the technical signals reproduces the result exactly. It is a <b>tail-event strategy</b> (breakeven without its best 5% of trades) whose level rides on one assumption — the volatility risk premium — that the daily recorder is now measuring against reality (first reading: favorable). Sizing doctrine: expect daily-marked drawdowns near <b>4× your standing risk cap</b>, year-long droughts, and profits arriving in bursts. Pilot at ~0.2% of capital at risk; judge it on years, not quarters. Nothing left to compute — from here, only real quotes and time raise confidence.</p>
   </section>
 
   <p class="foot">Generated from runs saved at <span class="mono">data_store/reports/backtest_FINAL_sp500_2026-07-10.txt</span> and <span class="mono">…_smallcap_2026-07-10.txt</span>. Return-on-risk and win rates as reported by the synthetic backtest. Win-rate intervals are Wilson score intervals on the overlap-adjusted effective sample (haircut 3.5×); profit factor, Sharpe, and return intervals are symbol-block bootstraps (2,000 resamples of 17,923 per-trade returns across 150 names). Methodology caveats above bound all figures.</p>
