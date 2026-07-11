@@ -32,15 +32,50 @@ TARGET_DTE = 35
 WATCH_FILE = BACKEND / "data_store" / "chain_watch.txt"
 CHAINS_DIR = BACKEND / "data_store" / "chains"
 
-# Starter universe: liquid mega-caps + index ETFs (tight spreads, real quotes)
-# plus the account's usual names. Edit chain_watch.txt to change -- one code
-# per line, '#' comments. ~30 names keeps the daily quota cost trivial.
+# Starter universe (seeds chain_watch.txt on first run; edit that file to
+# change yours). Layers: index ETFs + liquid mega-caps, sector-stratified
+# S&P (5/GICS sector), mid-caps (2/sector), liquid small-caps, high-IV
+# names, NASDAQ depth, S&P breadth, and liquid Russell names -- all
+# verified optionable at add time. ~218 names; recorder paces ~2s/symbol
+# (~35-40 min/day).
 DEFAULT_WATCH = [
-    "US.SPY", "US.QQQ", "US.IWM",
-    "US.AAPL", "US.MSFT", "US.NVDA", "US.AMZN", "US.GOOGL", "US.META",
-    "US.TSLA", "US.AMD", "US.AVGO", "US.JPM", "US.XOM", "US.UNH",
-    "US.LLY", "US.V", "US.COST", "US.NFLX", "US.CRM",
-    "US.MSTR", "US.FUTU", "US.NVO", "US.GRAB", "US.TEM", "US.IREN",
+    "US.SPY", "US.QQQ", "US.IWM", "US.AAPL", "US.MSFT", "US.NVDA",
+    "US.AMZN", "US.GOOGL", "US.META", "US.TSLA", "US.AMD", "US.AVGO",
+    "US.JPM", "US.XOM", "US.UNH", "US.LLY", "US.V", "US.COST",
+    "US.NFLX", "US.CRM", "US.MSTR", "US.FUTU", "US.NVO", "US.GRAB",
+    "US.TEM", "US.IREN", "US.ADM", "US.AIG", "US.ALB", "US.AOS",
+    "US.APA", "US.BG", "US.BSX", "US.BXP", "US.C", "US.CHRW",
+    "US.COIN", "US.CPT", "US.D", "US.DECK", "US.DIS", "US.DLR",
+    "US.EA", "US.ECHO", "US.EOG", "US.EQIX", "US.ERIE", "US.EVRG",
+    "US.EXC", "US.FCX", "US.FTV", "US.GEV", "US.GIS", "US.GM",
+    "US.HONA", "US.HRL", "US.IFF", "US.JBHT", "US.JBL", "US.LYV",
+    "US.MCD", "US.MGM", "US.MPWR", "US.MSCI", "US.NEM", "US.NKE",
+    "US.NUE", "US.PRU", "US.PSKY", "US.PSX", "US.REG", "US.SJM",
+    "US.SO", "US.SYK", "US.T", "US.TDY", "US.UHS", "US.VLO",
+    "US.VTRS", "US.XEL", "US.ZBH", "US.ACI", "US.CARG", "US.DK",
+    "US.EVCM", "US.FA", "US.FROG", "US.FRT", "US.HWKN", "US.IPAR",
+    "US.KNTK", "US.LUMN", "US.MTRN", "US.NSA", "US.RNST", "US.SR",
+    "US.STOK", "US.UA", "US.UGI", "US.ADV", "US.AEVA", "US.BRCC",
+    "US.BYND", "US.CURI", "US.CVGI", "US.CWH", "US.IMKTA", "US.IZEA",
+    "US.MGNI", "US.MARA", "US.RIOT", "US.CLSK", "US.HUT", "US.PLTR",
+    "US.SMCI", "US.AFRM", "US.SOFI", "US.RBLX", "US.DKNG", "US.CVNA",
+    "US.UPST", "US.HOOD", "US.ROKU", "US.SNAP", "US.NIO", "US.RIVN",
+    "US.LCID", "US.PLUG", "US.IONQ", "US.RGTI", "US.SOUN", "US.ARM",
+    "US.MRNA", "US.ENPH", "US.CELH", "US.GME", "US.AMC", "US.APP",
+    "US.ACHR", "US.JOBY", "US.RKLB", "US.LUNR", "US.ASTS", "US.BBAI",
+    "US.OKLO", "US.SMR", "US.ADBE", "US.INTC", "US.CSCO", "US.QCOM",
+    "US.TXN", "US.AMAT", "US.ISRG", "US.INTU", "US.PYPL", "US.BKNG",
+    "US.PANW", "US.SNPS", "US.CDNS", "US.MRVL", "US.MU", "US.LRCX",
+    "US.KLAC", "US.ABNB", "US.DASH", "US.MELI", "US.WDAY", "US.DDOG",
+    "US.CRWD", "US.ZS", "US.NET", "US.MDB", "US.TTD", "US.GILD",
+    "US.REGN", "US.VRTX", "US.SBUX", "US.PDD", "US.BAC", "US.WFC",
+    "US.GS", "US.MS", "US.SCHW", "US.CAT", "US.DE", "US.BA",
+    "US.GE", "US.LMT", "US.RTX", "US.HON", "US.UPS", "US.FDX",
+    "US.CVX", "US.COP", "US.SLB", "US.OXY", "US.DAL", "US.UAL",
+    "US.CCL", "US.RCL", "US.WMT", "US.TGT", "US.HD", "US.LOW",
+    "US.PFE", "US.JNJ", "US.MRK", "US.ABBV", "US.BMY", "US.OSCR",
+    "US.ETSY", "US.CROX", "US.W", "US.RUM", "US.CHPT", "US.PTON",
+    "US.MQ", "US.FUBO",
 ]
 
 
