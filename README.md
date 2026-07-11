@@ -17,9 +17,19 @@ S&P 500 — all on a clean dashboard a non-finance reader can follow.
 Every number on screen is computed by deterministic Python you can read line by
 line — indicators, scoring, options math, portfolio optimizer. An LLM (optional)
 only narrates that precomputed JSON in plain English; it never invents a figure,
-and the app works fully with zero AI key. It does not place trades, does not
-predict prices, and does not scrape news — it reads your actual positions and
-tells you what the numbers already say.
+and the app works fully with zero AI key. It does not place real trades, does
+not predict prices, and does not scrape news — it reads your actual positions
+and tells you what the numbers already say.
+
+The one exception to read-only is an optional **paper-trading loop**,
+hard-locked to Moomoo's SIMULATE environment by construction (see the
+guardrails header in `backend/app/brokers/paper_broker.py`) — it cannot touch
+real money. Backtests, parameter sweeps, the analysis/review suite, and the
+daily recorder → signal-log → paper-trade loop are documented in
+[`docs/RUNNING.md`](docs/RUNNING.md). All personal data (bar caches, chain
+archives, signal logs, trades, journals, result reports) stays in the
+gitignored `backend/data_store/` and never leaves your machine — the repo
+carries the base version only.
 
 ## Why this is different
 

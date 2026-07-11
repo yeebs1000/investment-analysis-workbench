@@ -32,3 +32,9 @@ Thumbs.db
 
 # Local scratch handoff notes (session context, not for the public repo)
 handoff.md
+
+# Personal run artifacts (results, reports, exports) — repo carries code only
+docs/backtest-report*
+docs/*.pdf
+backtest-report*.pdf
+_yeebs_launch.ps1
