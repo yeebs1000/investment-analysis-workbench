@@ -33,7 +33,9 @@ MAX_LEG_SPREAD_PCT = 10.0     # per leg, bid/ask over mid
 MIN_LEG_OI = 50
 MAX_NEW_PER_DAY = 8
 MAX_OPEN_STRUCTURES = 30
-EXIT_DTE = 7                  # close everything at <= this DTE (pin/gamma risk)
+EXIT_DTE = 7                  # structures with SHORT legs: close at <= this DTE (pin/assignment risk)
+EXIT_DTE_ALL_LONG = 2         # all-long structures (straddles) have no assignment risk;
+                              # the exit grid showed time-stops cost them ~4pts -- ride to near expiry
 CONTRACT_SIZE = 100
 
 SIGNALS_DIR = BACKEND / "data_store" / "signals"
@@ -95,6 +97,7 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
         if s["status"] != "OPEN":
             continue
         dte_left = (dt.date.fromisoformat(s["expiry"]) - dt.date.fromisoformat(today)).days
+        exit_dte = EXIT_DTE_ALL_LONG if all(l["side"] == "BUY" for l in s["legs"]) else EXIT_DTE
         # mark: sum of leg (market - entry) * sign
         pnl = 0.0
         marks_ok = True
@@ -108,8 +111,8 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
         rule = MANAGEMENT.get(s["strategy"], DEFAULT_RULE)
         base = s.get("max_profit")
         reason = None
-        if dte_left <= EXIT_DTE:
-            reason = f"DTE {dte_left} <= {EXIT_DTE}"
+        if dte_left <= exit_dte:
+            reason = f"DTE {dte_left} <= {exit_dte}"
         elif marks_ok and rule.profit_target is not None and base and base > 0 \
                 and pnl >= rule.profit_target * base:
             reason = f"profit target ({pnl:+.2f} >= {rule.profit_target:.0%} of {base:.2f})"
