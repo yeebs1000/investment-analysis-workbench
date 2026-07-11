@@ -1,0 +1,123 @@
+"""Daily option-chain snapshot recorder.
+
+No historical option chains exist for this account -- the backtest prices
+synthetic ones. This recorder builds the real archive going forward: once a
+day (during US regular hours) it snapshots the near-money chain for every
+symbol in the watch file and appends a dated parquet under
+data_store/chains/<YYYY-MM-DD>/<code>.parquet with bid/ask/iv/delta/OI --
+exactly the columns the strategist consumes, plus spot/expiry/dte/source.
+
+In 6-12 months this archive supports what the synthetic backtest cannot:
+real-quote entry premiums, fill-location tests, and liquidity filters.
+
+Usage:  python -m scripts.record_chains          (from backend/, venv python)
+Idempotent per day: symbols already recorded today are skipped, so a re-run
+after a partial failure only fetches what's missing.
+
+Schedule (Windows Task Scheduler, 23:00 local = late US morning):
+  schtasks /Create /TN "TechnicalOptimiser\\RecordChains" /SC DAILY /ST 23:00 ^
+    /TR "cmd /c cd /d <backend dir> && .venv\\Scripts\\python.exe -m scripts.record_chains"
+"""
+from __future__ import annotations
+
+import datetime as dt
+import os
+import sys
+from pathlib import Path
+
+BACKEND = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BACKEND))
+
+TARGET_DTE = 35
+WATCH_FILE = BACKEND / "data_store" / "chain_watch.txt"
+CHAINS_DIR = BACKEND / "data_store" / "chains"
+
+# Starter universe: liquid mega-caps + index ETFs (tight spreads, real quotes)
+# plus the account's usual names. Edit chain_watch.txt to change -- one code
+# per line, '#' comments. ~30 names keeps the daily quota cost trivial.
+DEFAULT_WATCH = [
+    "US.SPY", "US.QQQ", "US.IWM",
+    "US.AAPL", "US.MSFT", "US.NVDA", "US.AMZN", "US.GOOGL", "US.META",
+    "US.TSLA", "US.AMD", "US.AVGO", "US.JPM", "US.XOM", "US.UNH",
+    "US.LLY", "US.V", "US.COST", "US.NFLX", "US.CRM",
+    "US.MSTR", "US.FUTU", "US.NVO", "US.GRAB", "US.TEM", "US.IREN",
+]
+
+
+def load_watchlist() -> list[str]:
+    if not WATCH_FILE.exists():
+        WATCH_FILE.write_text(
+            "# one code per line; recorded daily by scripts/record_chains.py\n"
+            + "\n".join(DEFAULT_WATCH) + "\n"
+        )
+    return [ln.strip().upper() for ln in WATCH_FILE.read_text().splitlines()
+            if ln.strip() and not ln.startswith("#")]
+
+
+PACING_S = 2.0        # pause between symbols -- rapid-fire snapshots trip
+                      # Moomoo's packet timeout (seen live: PacketErr.Timeout)
+RETRY_PASSES = 2      # transient timeouts usually clear on a later pass
+
+
+def _record_one(service, code: str, out_dir: Path, today: str) -> None:
+    """Snapshot one symbol's near-money chain to parquet. Raises on any miss."""
+    # spot from a live snapshot (cheap; no full technical analysis)
+    with service._lock:
+        snap = service._client.get_snapshot([code])
+    spot = float(snap.iloc[0]["last_price"]) if snap is not None and not snap.empty else None
+    if not spot or spot <= 0:
+        raise ValueError("no spot")
+    picked = service._pick_option_expiry(code, TARGET_DTE)
+    if picked is None:
+        raise ValueError("no expiry")
+    source, expiry, dte, _ = picked
+    contracts = service._option_contracts_from(source, code, expiry, spot)
+    if contracts is None or contracts.empty:
+        raise ValueError("empty chain")
+    contracts = contracts.copy()
+    contracts["snap_date"] = today
+    contracts["snap_ts"] = dt.datetime.now().isoformat(timespec="seconds")
+    contracts["underlying"] = code
+    contracts["spot"] = spot
+    contracts["expiry"] = expiry
+    contracts["dte"] = dte
+    contracts["source"] = source
+    contracts.to_parquet(out_dir / f"{code}.parquet", index=False)
+    two_sided = int(((contracts["bid"] > 0) & (contracts["ask"] > 0)).sum())
+    print(f"  {code}: {len(contracts)} contracts ({two_sided} two-sided) "
+          f"exp {expiry} via {source}", flush=True)
+
+
+def main() -> None:
+    import time
+    from app.services.analysis_service import service
+
+    today = dt.date.today().isoformat()
+    out_dir = CHAINS_DIR / today
+    out_dir.mkdir(parents=True, exist_ok=True)
+    codes = load_watchlist()
+
+    ok = 0
+    for attempt in range(1, RETRY_PASSES + 2):
+        done = {p.stem for p in out_dir.glob("*.parquet")}
+        todo = [c for c in codes if c not in done]
+        if not todo:
+            break
+        print(f"{today} pass {attempt}: {len(todo)} to record ({len(done)} done)", flush=True)
+        for code in todo:
+            try:
+                _record_one(service, code, out_dir, today)
+                ok += 1
+            except Exception as e:  # noqa: BLE001 - one bad symbol never kills the run
+                print(f"  {code}: SKIP ({e})", flush=True)
+            time.sleep(PACING_S)   # don't trip Moomoo's packet pacing
+    missing = [c for c in codes if c not in {p.stem for p in out_dir.glob('*.parquet')}]
+    print(f"done: {ok} recorded this run, {len(missing)} missing "
+          f"({', '.join(missing) if missing else 'none'}) -> {out_dir}", flush=True)
+    # Moomoo SDK leaves non-daemon threads; exit hard like the backtest CLI does.
+    sys.stdout.flush()
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    main()
