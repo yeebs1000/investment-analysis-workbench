@@ -33,6 +33,11 @@ MAX_LEG_SPREAD_PCT = 10.0     # per leg, bid/ask over mid
 MIN_LEG_OI = 50
 MAX_NEW_PER_DAY = 8
 MAX_OPEN_STRUCTURES = 30
+
+# --- budget sizing (pass --budget N; without it every structure is 1 lot) ----
+RISK_FRAC = 0.01              # max loss per structure as fraction of budget
+MAX_CONTRACTS = 10            # per structure, regardless of budget
+CAP_FRAC = 0.15               # max capital tied to ONE structure (diversification)
 EXIT_DTE = 7                  # structures with SHORT legs: close at <= this DTE (pin/assignment risk)
 EXIT_DTE_ALL_LONG = 2         # all-long structures (straddles) have no assignment risk;
                               # the exit grid showed time-stops cost them ~4pts -- ride to near expiry
@@ -60,6 +65,35 @@ def _mid(row) -> float | None:
     if b and a and b > 0 and a >= b:
         return (b + a) / 2.0
     return None
+
+
+def capital_required(strategy: str, legs: list[dict], net: float | None,
+                     max_loss: float | None, n: int) -> float:
+    """Paper capital a structure ties up: CSP posts the strike; debits pay the
+    debit; defined-risk credit spreads post the max loss as margin."""
+    if strategy == "Cash-Secured Put" and legs:
+        return legs[0]["strike"] * CONTRACT_SIZE * n
+    if net is not None and net < 0:
+        return abs(net) * CONTRACT_SIZE * n
+    return (max_loss or 0.0) * CONTRACT_SIZE * n
+
+
+def size_structure(budget: float | None, strategy: str, legs: list[dict],
+                   net: float | None, max_loss: float | None,
+                   capital_in_use: float) -> tuple[int, float, str]:
+    """(contracts, capital, reason-if-zero). Without a budget: 1 lot."""
+    if budget is None:
+        return 1, capital_required(strategy, legs, net, max_loss, 1), ""
+    if not max_loss or max_loss <= 0:
+        return 0, 0.0, "no defined max loss"
+    n = int((budget * RISK_FRAC) // (max_loss * CONTRACT_SIZE))
+    n = min(n, MAX_CONTRACTS)
+    while n > 0:
+        cap = capital_required(strategy, legs, net, max_loss, n)
+        if cap <= budget * CAP_FRAC and capital_in_use + cap <= budget:
+            return n, cap, ""
+        n -= 1
+    return 0, 0.0, "risk/capital budget exceeded"
 
 
 def structure_groups(sig: pd.DataFrame):
@@ -140,6 +174,9 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
 def main() -> None:
     from app.brokers.paper_broker import PaperBroker
 
+    budget = None
+    if "--budget" in sys.argv:
+        budget = float(sys.argv[sys.argv.index("--budget") + 1])
     today = dt.date.today().isoformat()
     sig_path = SIGNALS_DIR / f"{today}.csv"
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -180,6 +217,8 @@ def main() -> None:
         journal.append(f"- no signal file for {today} (market holiday or recorder gap)")
     else:
         sig = pd.read_csv(sig_path)
+        capital_in_use = sum(s.get("capital", 0.0) for s in structs
+                             if s["status"] in ("OPEN", "CLOSING"))
         for code, strat, legs in structure_groups(sig):
             if placed >= MAX_NEW_PER_DAY or n_open + placed >= MAX_OPEN_STRUCTURES:
                 journal.append("- caps reached; remaining signals skipped")
@@ -187,21 +226,29 @@ def main() -> None:
             if code in open_unders:
                 continue                    # one structure per underlying
             sid = f"{today}-{code}-{strat}".replace(" ", "_")
+            row0 = legs.iloc[0]
+            net = float(row0["net_debit_credit"]) if pd.notna(row0["net_debit_credit"]) else None
+            max_loss = float(row0["max_loss"]) if pd.notna(row0["max_loss"]) else None
+            leg_meta = [{"strike": float(l["leg_strike"])} for _, l in legs.iterrows()]
+            n_contracts, capital, why = size_structure(budget, strat, leg_meta, net,
+                                                       max_loss, capital_in_use)
+            if n_contracts < 1:
+                journal.append(f"- skip {code} {strat}: {why}")
+                continue
             leg_recs = []
             for _, leg in legs.iterrows():
                 m = _mid(leg)
-                res = broker.place_limit(leg["leg_code"], 1, leg["leg_action"].upper(), m,
+                res = broker.place_limit(leg["leg_code"], n_contracts,
+                                         leg["leg_action"].upper(), m,
                                          note=f"ENTRY {sid}")
                 leg_recs.append({
-                    "code": leg["leg_code"], "side": leg["leg_action"].upper(), "qty": 1,
+                    "code": leg["leg_code"], "side": leg["leg_action"].upper(), "qty": n_contracts,
                     "right": leg["leg_right"], "strike": float(leg["leg_strike"]),
                     "entry_mid": round(m, 2), "theo": round(float(leg["theo_bsm"]), 2) if pd.notna(leg["theo_bsm"]) else None,
                     "bid": float(leg["bid"]), "ask": float(leg["ask"]),
                     "order_status": res.get("status"), "order_id": res.get("order_id"),
                 })
-            row0 = legs.iloc[0]
-            net = float(row0["net_debit_credit"]) if pd.notna(row0["net_debit_credit"]) else None
-            max_loss = float(row0["max_loss"]) if pd.notna(row0["max_loss"]) else None
+            capital_in_use += capital
             # max profit: credit structures = credit; 2-leg verticals = width - debit
             max_profit = None
             if net is not None and net > 0:
@@ -215,12 +262,13 @@ def main() -> None:
                 "pop_pct": float(row0["pop_pct"]) if pd.notna(row0["pop_pct"]) else None,
                 "ev_per_share": float(row0["ev_per_share"]) if pd.notna(row0["ev_per_share"]) else None,
                 "net_debit_credit": net, "max_loss": max_loss, "max_profit": max_profit,
+                "contracts": n_contracts, "capital": round(capital, 2),
                 "legs": leg_recs,
             })
             open_unders.add(code)
             placed += 1
-            journal.append(f"- ENTER {code} {strat}: {len(leg_recs)} leg(s) at mid "
-                           f"(POP {row0['pop_pct']}%, EV {row0['ev_per_share']})")
+            journal.append(f"- ENTER {code} {strat}: {n_contracts}x {len(leg_recs)} leg(s) at mid, "
+                           f"capital ~${capital:,.0f} (POP {row0['pop_pct']}%, EV {row0['ev_per_share']})")
         if placed == 0 and sig_path.exists():
             journal.append("- no structures passed criteria today")
 
