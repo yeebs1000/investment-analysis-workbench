@@ -303,6 +303,16 @@ def main() -> None:
         + "\n\nLedger: `data_store/paper/structures.jsonl` · orders: `data_store/paper/order_ledger.jsonl`\n",
         encoding="utf-8")
 
+    # equity snapshot + dashboard refresh (best-effort; never blocks the run)
+    try:
+        from scripts.build_dashboard import build, snapshot_equity
+        cash = float(acc.iloc[0]["cash"]) if "cash" in acc.columns else None
+        if equity is not None:
+            snapshot_equity(equity, cash)
+        build()
+    except Exception as e:  # noqa: BLE001
+        print(f"dashboard refresh failed: {e}")
+
     print(f"{today}: {placed} entered, {len(closed)} closing, {n_open_now} open -> {note}")
     broker.close()
     sys.stdout.flush()
