@@ -87,6 +87,10 @@ def size_structure(budget: float | None, strategy: str, legs: list[dict],
     if not max_loss or max_loss <= 0:
         return 0, 0.0, "no defined max loss"
     n = int((budget * RISK_FRAC) // (max_loss * CONTRACT_SIZE))
+    # a single lot is allowed slightly above the risk sliver (expensive
+    # straddles are the P&L engine; 1 lot of a $47 straddle beats 0 lots)
+    if n == 0 and max_loss * CONTRACT_SIZE <= budget * RISK_FRAC * 2.5:
+        n = 1
     n = min(n, MAX_CONTRACTS)
     while n > 0:
         cap = capital_required(strategy, legs, net, max_loss, n)
