@@ -175,6 +175,40 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
     return lines
 
 
+def reconcile(broker, structs: list[dict]) -> list[str]:
+    """Post-session counter-check against broker truth (user directive after a
+    day-1 mis-attribution: order LIMIT price != executed price on SIMULATE).
+    Updates each open leg's fill price from the broker's position cost_price,
+    recomputes structure net entry, and flags qty mismatches."""
+    lines = []
+    try:
+        pos = broker.positions()
+    except Exception as e:  # noqa: BLE001
+        return [f"- reconcile skipped: {e}"]
+    cost = {str(p["code"]): float(p["cost_price"]) for _, p in pos.iterrows()}
+    bqty = {str(p["code"]): float(p["qty"]) for _, p in pos.iterrows() if abs(p["qty"]) > 0}
+    lqty: dict[str, float] = {}
+    for s in structs:
+        if s["status"] not in ("OPEN", "CLOSING"):
+            continue
+        net = 0.0
+        for leg in s["legs"]:
+            sign = 1 if leg["side"] == "BUY" else -1
+            lqty[leg["code"]] = lqty.get(leg["code"], 0) + sign * leg["qty"]
+            if leg["code"] in cost and cost[leg["code"]] > 0:
+                actual = cost[leg["code"]]
+                if abs(actual - (leg.get("fill_price") or leg["entry_mid"])) >= 0.01:
+                    lines.append(f"- fill corrected {leg['code']}: recorded "
+                                 f"{leg.get('fill_price') or leg['entry_mid']} -> broker {actual}")
+                leg["fill_price"] = actual
+            net += sign * (leg.get("fill_price") or leg["entry_mid"])
+        s["net_entry_actual"] = round(net, 2)
+    for c in set(lqty) | set(bqty):
+        if abs(lqty.get(c, 0) - bqty.get(c, 0)) >= 0.5:
+            lines.append(f"- QTY MISMATCH {c}: ledger {lqty.get(c, 0):+g} vs broker {bqty.get(c, 0):+g}")
+    return lines or ["- reconciled clean: fills and quantities match broker"]
+
+
 def main() -> None:
     from app.brokers.paper_broker import PaperBroker
 
@@ -275,6 +309,10 @@ def main() -> None:
                            f"capital ~${capital:,.0f} (POP {row0['pop_pct']}%, EV {row0['ev_per_share']})")
         if placed == 0 and sig_path.exists():
             journal.append("- no structures passed criteria today")
+
+    # post-session counter-check: broker truth beats our order records
+    journal.append("\n## Reconciliation (broker truth)")
+    journal += reconcile(broker, structs)
 
     _save_structures(structs)
 
