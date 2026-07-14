@@ -31,7 +31,7 @@ SIGNALS_DIR = BACKEND / "data_store" / "signals"
 # on the nearest tradeable strike instead of a fantasy one. Thresholds match
 # scripts/paper_trade.py exactly; keep them in lockstep.
 MAX_LEG_SPREAD_PCT = 10.0
-MIN_OI = 50
+MIN_OI = 25            # was 50; relaxed as a measured experiment (spread gate unchanged)
 MIN_TRADEABLE_PER_SIDE = 3   # need a few strikes per right or skip the symbol
 
 

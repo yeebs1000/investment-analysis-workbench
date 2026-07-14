@@ -30,7 +30,7 @@ import pandas as pd
 
 # --- criteria / caps ---------------------------------------------------------
 MAX_LEG_SPREAD_PCT = 10.0     # per leg, bid/ask over mid
-MIN_LEG_OI = 50
+MIN_LEG_OI = 25       # lockstep with log_signals prefilter
 MAX_NEW_PER_DAY = 8
 MAX_OPEN_STRUCTURES = 30
 
@@ -38,6 +38,15 @@ MAX_OPEN_STRUCTURES = 30
 RISK_FRAC = 0.01              # max loss per structure as fraction of budget
 MAX_CONTRACTS = 10            # per structure, regardless of budget
 CAP_FRAC = 0.15               # max capital tied to ONE structure (diversification)
+
+# --- trailing high-water exit (user directive: close at the highs, don't ride
+# a winner back down). Arms once P&L reaches TRAIL_ARM x base (base = max
+# profit for defined-risk, entry debit for straddles); closes when P&L gives
+# back TRAIL_GIVEBACK of the PEAK. Peak is tracked per structure in the ledger
+# at each beat -- daily granularity, so intraday spikes between beats are
+# invisible (known limit of a once-a-day loop).
+TRAIL_ARM = 0.50
+TRAIL_GIVEBACK = 0.35
 EXIT_DTE = 7                  # structures with SHORT legs: close at <= this DTE (pin/assignment risk)
 EXIT_DTE_ALL_LONG = 2         # all-long structures (straddles) have no assignment risk;
                               # the exit grid showed time-stops cost them ~4pts -- ride to near expiry
@@ -148,12 +157,23 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
             pnl += sign * (mark - leg["entry_mid"])
         rule = MANAGEMENT.get(s["strategy"], DEFAULT_RULE)
         base = s.get("max_profit")
+        # straddles have no defined max profit -- trail off the entry debit
+        trail_base = base if (base and base > 0) else abs(s.get("net_debit_credit") or 0) or None
+        if marks_ok and trail_base:
+            if pnl > (s.get("peak_pnl") or -1e9):
+                s["peak_pnl"] = round(pnl, 3)
+        peak = s.get("peak_pnl")
         reason = None
         if dte_left <= exit_dte:
             reason = f"DTE {dte_left} <= {exit_dte}"
         elif marks_ok and rule.profit_target is not None and base and base > 0 \
                 and pnl >= rule.profit_target * base:
             reason = f"profit target ({pnl:+.2f} >= {rule.profit_target:.0%} of {base:.2f})"
+        elif marks_ok and trail_base and peak is not None \
+                and peak >= TRAIL_ARM * trail_base \
+                and pnl <= peak * (1 - TRAIL_GIVEBACK):
+            reason = (f"trailing high-water stop (peak {peak:+.2f}, now {pnl:+.2f}, "
+                      f"gave back >{TRAIL_GIVEBACK:.0%})")
         elif marks_ok and rule.stop_to_be is not None and base and base > 0:
             if pnl >= rule.stop_to_be * base:
                 s["be_armed"] = True

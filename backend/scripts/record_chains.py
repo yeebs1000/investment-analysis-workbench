@@ -28,7 +28,10 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND))
 
-TARGET_DTE = 35
+# 49 CALENDAR days ~= the validated 35-TRADING-day tenor (the original 35 here
+# was calendar -- a shorter tenor than the backtest validated). The DTE x delta
+# plateau grid also favors the longer cell (+23.4% at DTE45-trading vs +21.7%).
+TARGET_DTE = 49
 WATCH_FILE = BACKEND / "data_store" / "chain_watch.txt"
 CHAINS_DIR = BACKEND / "data_store" / "chains"
 
