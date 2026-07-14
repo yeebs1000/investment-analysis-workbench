@@ -958,6 +958,14 @@ class AnalysisService:
         )
         return result
 
+    @staticmethod
+    def _is_third_friday_impl(strike_time: str) -> bool:
+        try:
+            d = datetime.fromisoformat(str(strike_time)[:10]).date()
+        except (ValueError, TypeError):
+            return False
+        return d.weekday() == 4 and 15 <= d.day <= 21   # Friday, 3rd week
+
     def _pick_option_expiry(self, code: str, target_dte: int):
         """Try Moomoo, then IBKR, then Tiger for expirations on `code`. Returns
         (source, expiry_str, dte, usable_expirations_df) for the first broker
@@ -980,8 +988,18 @@ class AnalysisService:
             usable = exp[exp["dist"] >= 10]
             if usable.empty and exp.empty:
                 continue
-            pick = (usable.iloc[(usable["dist"] - target_dte).abs().argsort()].iloc[0]
-                    if not usable.empty else exp.iloc[exp["dist"].astype(float).argmax()])
+            if not usable.empty:
+                # Prefer the 3rd-Friday MONTHLY nearest the target: single-name
+                # open interest concentrates there, while weeklies are near-empty
+                # (verified live: COIN/ARM weekly OI ~1-5 fails the liquidity
+                # gate). Only fall back to nearest-any if no monthly is within a
+                # reasonable window of the target tenor.
+                monthly = usable[usable["strike_time"].apply(self._is_third_friday_impl)]
+                cand = monthly if not monthly.empty and \
+                    (monthly["dist"] - target_dte).abs().min() <= 25 else usable
+                pick = cand.iloc[(cand["dist"] - target_dte).abs().argsort()].iloc[0]
+            else:
+                pick = exp.iloc[exp["dist"].astype(float).argmax()]
             return source, str(pick["strike_time"]), int(pick["dist"]), usable
         return None
 
