@@ -332,6 +332,51 @@ EXPECTED_LEGS = {
 }
 
 
+def chase_entry_fills(broker, structs, today, walk_frac=0.5) -> list[str]:
+    """MODIFY today's still-resting entry legs toward the market (walk_frac of
+    the half-spread) instead of cancel+replace -- preserves queue priority and
+    avoids the naked window. Runs each session; over successive beats a leg
+    converges to a fill. Live finding: resting at signal-time mid gets
+    adversely selected within ~30 min."""
+    lines = []
+    try:
+        from moomoo import OrderStatus
+        working = broker.orders(status_filter_list=[OrderStatus.SUBMITTED])
+    except Exception as e:  # noqa: BLE001
+        return [f"- entry-fill chase skipped ({e})"]
+    if working.empty:
+        return ["- no resting entry orders"]
+    # map working orders to today's OPEN structures' legs
+    today_legs = {l["code"]: (s, l) for s in structs if s["status"] == "OPEN"
+                  and s["entry_date"] == today for l in s["legs"]}
+    codes = [str(o["code"]) for _, o in working.iterrows() if str(o["code"]) in today_legs]
+    if not codes:
+        return ["- no resting entry legs to chase"]
+    snap = _live_snapshot(codes)
+    n = 0
+    for _, o in working.iterrows():
+        c = str(o["code"])
+        if c not in today_legs:
+            continue
+        _, leg = today_legs[c]
+        oid, qty, old = str(o["order_id"]), float(o["qty"]), float(o["price"])
+        if snap is None or c not in snap.index:
+            continue
+        bid = float(snap.loc[c, "bid_price"]); ask = float(snap.loc[c, "ask_price"])
+        if bid <= 0 or ask <= 0:
+            continue
+        mid = (bid + ask) / 2
+        newpx = (round(mid - walk_frac * (mid - bid), 2) if leg["side"] == "SELL"
+                 else round(mid + walk_frac * (ask - mid), 2))
+        if abs(newpx - old) < 0.01:
+            continue
+        res = broker.modify_price(oid, newpx, qty=qty, note="chase entry fill")
+        if res.get("status") == "MODIFIED":
+            n += 1
+            lines.append(f"- modify {c}: {old} -> {newpx} (mkt {bid}/{ask})")
+    return lines or ["- resting entries already at market"]
+
+
 def do_entries(broker, structs, journal, sig_path, budget, today) -> int:
     n_open = sum(1 for s in structs if s["status"] in ("OPEN", "CLOSING"))
     open_unders = {s["underlying"] for s in structs if s["status"] in ("OPEN", "CLOSING")}
@@ -484,7 +529,11 @@ def main() -> None:
         journal += check_exits(broker, structs, today) or ["- none"]
         _save_structures(structs)
 
-        # 4. entries (EV-ranked, per-day capped, leg-validated)
+        # 4. chase yesterday-and-today's resting entry legs toward fill (modify)
+        journal.append("\n## Entry-fill chase")
+        journal += chase_entry_fills(broker, structs, today)
+
+        # 5. entries (EV-ranked, per-day capped, leg-validated)
         journal.append("\n## Entries")
         placed = do_entries(broker, structs, journal, sig_path, budget, today)
         _save_structures(structs)

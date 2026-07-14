@@ -148,6 +148,35 @@ class PaperBroker:
         self._ledger(intent)
         return intent
 
+    def modify_price(self, order_id: str, price: float, qty: float | None = None,
+                     note: str = "") -> dict:
+        """Amend a RESTING order's price (and optionally qty) in place, instead
+        of cancel-then-replace. Preserves the order's queue identity and avoids
+        the window where a leg sits cancelled with no working order. qty=None
+        keeps the original quantity (the SDK requires a qty, so callers pass the
+        current one). Paper account only."""
+        _assert_simulate(PAPER_ENV)
+        try:
+            from moomoo import ModifyOrderOp
+        except ImportError:  # pragma: no cover
+            from futu import ModifyOrderOp
+        if qty is None:
+            # look up the working order's qty; the SDK needs an explicit value
+            cur = self.orders()
+            row = cur[cur["order_id"].astype(str) == str(order_id)] if not cur.empty else cur
+            qty = float(row.iloc[0]["qty"]) if not row.empty else 0
+        rec = {"ts": dt.datetime.now().isoformat(timespec="seconds"), "env": "SIMULATE",
+               "acc_id": self.acc_id, "order_id": order_id, "action": "MODIFY",
+               "new_price": round(price, 2), "new_qty": qty, "note": note, "status": "MODIFY_INTENT"}
+        self._ledger(rec)
+        ret, data = self._trade.modify_order(
+            ModifyOrderOp.NORMAL, order_id, qty, round(price, 2),
+            trd_env=PAPER_ENV, acc_id=self.acc_id)
+        rec = {**rec, "status": "MODIFIED" if ret == RET_OK else "MODIFY_FAILED",
+               "error": None if ret == RET_OK else str(data)}
+        self._ledger(rec)
+        return rec
+
     def cancel_order(self, order_id: str) -> bool:
         _assert_simulate(PAPER_ENV)
         try:
