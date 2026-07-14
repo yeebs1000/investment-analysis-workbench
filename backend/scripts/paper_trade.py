@@ -1,7 +1,7 @@
 """Daily PAPER trading engine (Moomoo SIMULATE account only -- see the
 guardrails in app/brokers/paper_broker.py).
 
-Flow (scheduled weekdays 23:45, after record_chains 23:00 + log_signals 23:30):
+Flow (scheduled weekdays 23:40 local, after record_chains 22:30 + log_signals 23:20):
  1. EXITS   -- mark open structures from paper positions; close any that hit
                the SAME management rules the backtest validated
                (options_backtest.MANAGEMENT), or DTE <= 7.
@@ -65,8 +65,13 @@ def _load_structures() -> list[dict]:
 
 
 def _save_structures(structs: list[dict]) -> None:
+    """Atomic write (tmp + replace): a crash or OneDrive sync lock mid-write
+    must never truncate the ledger."""
     PAPER_DIR.mkdir(parents=True, exist_ok=True)
-    STRUCT_LEDGER.write_text("\n".join(json.dumps(s) for s in structs) + "\n", encoding="utf-8")
+    tmp = STRUCT_LEDGER.with_suffix(".jsonl.tmp")
+    tmp.write_text("\n".join(json.dumps(s) for s in structs) + "\n", encoding="utf-8")
+    import os
+    os.replace(tmp, STRUCT_LEDGER)
 
 
 def _mid(row) -> float | None:
@@ -126,13 +131,96 @@ def structure_groups(sig: pd.DataFrame):
             yield code, strat, g
 
 
+def _broker_qty(broker):
+    """{code: signed qty} of actual broker holdings (zero rows dropped)."""
+    pos = broker.positions()
+    return {str(p["code"]): float(p["qty"]) for _, p in pos.iterrows()
+            if abs(float(p["qty"])) > 0}, pos
+
+
+def _close_legs(broker, s: dict, legs: list[dict], reason: str, bqty: dict,
+                snap=None) -> None:
+    """Place CROSSING exit orders (sell at bid / buy at ask) for the legs we
+    actually hold -- certainty of fill over price finesse, and every fill is a
+    real cost datapoint. Falls back to the ledger mid if no live quote."""
+    for leg in legs:
+        held = abs(bqty.get(leg["code"], 0.0))
+        qty = min(leg["qty"], held)
+        if qty < 1:
+            continue
+        side = "SELL" if leg["side"] == "BUY" else "BUY"
+        px = None
+        if snap is not None and leg["code"] in snap.index:
+            row = snap.loc[leg["code"]]
+            px = float(row["bid_price"]) if side == "SELL" else float(row["ask_price"])
+            if not px or px <= 0:
+                px = None
+        if px is None:
+            px = leg.get("fill_price") or leg["entry_mid"]
+        broker.place_limit(leg["code"], qty, side, round(px, 2),
+                           note=f"EXIT {s['id']}: {reason}")
+
+
+def _live_snapshot(codes: list[str]):
+    """Best-effort live quotes for exit pricing; None if unavailable."""
+    try:
+        from app.services.analysis_service import service
+        with service._lock:
+            snap = service._client.get_snapshot(codes)
+        return snap.set_index("code")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sync_lifecycle(broker, structs: list[dict], today: str) -> list[str]:
+    """State-machine sync against broker truth, run FIRST each session.
+    OPEN (entered before today) with no legs held  -> CANCELLED_UNFILLED
+    OPEN with only some legs held                  -> BROKEN -> close held legs
+    CLOSING with no legs held                      -> CLOSED (capital released)
+    CLOSING with legs still held                   -> re-place crossing exits
+    Without this, CLOSING was a dead-end and phantom OPEN structures would
+    eventually fire DTE exits for positions that never existed."""
+    lines = []
+    try:
+        bqty, _ = _broker_qty(broker)
+    except Exception as e:  # noqa: BLE001
+        return [f"- lifecycle sync skipped: {e}"]
+    retry_codes = [l["code"] for s in structs if s["status"] == "CLOSING" for l in s["legs"]]
+    snap = _live_snapshot(retry_codes) if retry_codes else None
+    for s in structs:
+        if s["status"] == "OPEN" and s["entry_date"] < today:
+            held = [l for l in s["legs"] if abs(bqty.get(l["code"], 0.0)) > 0]
+            if not held:
+                s["status"] = "CANCELLED_UNFILLED"
+                s["exit_reason"] = "entry orders never filled"
+                s["exit_date"] = today
+                lines.append(f"- {s['underlying']} {s['strategy']}: entry never filled -> CANCELLED_UNFILLED")
+            elif len(held) < len(s["legs"]):
+                s["status"] = "CLOSING"
+                s["exit_reason"] = "broken partial entry -- flattening held legs"
+                s["exit_date"] = today
+                leg_snap = _live_snapshot([l["code"] for l in held])
+                _close_legs(broker, s, held, s["exit_reason"], bqty, leg_snap)
+                lines.append(f"- {s['underlying']} {s['strategy']}: PARTIAL entry -> flattening {len(held)} held leg(s)")
+        elif s["status"] == "CLOSING":
+            held = [l for l in s["legs"] if abs(bqty.get(l["code"], 0.0)) > 0]
+            if not held:
+                s["status"] = "CLOSED"
+                s["closed_date"] = today
+                lines.append(f"- {s['underlying']} {s['strategy']}: exits filled -> CLOSED")
+            else:
+                _close_legs(broker, s, held, f"retry: {s.get('exit_reason', 'exit')}", bqty, snap)
+                lines.append(f"- {s['underlying']} {s['strategy']}: retrying exit on {len(held)} leg(s) at crossing prices")
+    return lines
+
+
 def check_exits(broker, structs: list[dict], today: str) -> list[str]:
     """Apply backtest management rules to open structures using paper position
-    marks. Returns journal lines."""
+    marks (fill_price basis where reconciled). Returns journal lines."""
     from app.analytics.options_backtest import MANAGEMENT, DEFAULT_RULE
     lines = []
     try:
-        pos = broker.positions()
+        bqty, pos = _broker_qty(broker)
     except Exception as e:  # noqa: BLE001
         return [f"- exits skipped: positions query failed ({e})"]
     by_code = {}
@@ -143,24 +231,30 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
     for s in structs:
         if s["status"] != "OPEN":
             continue
+        # only manage structures whose every leg is actually held (fresh
+        # entries may still be filling; phantom ones were handled by lifecycle)
+        if not all(abs(bqty.get(l["code"], 0.0)) > 0 for l in s["legs"]):
+            continue
         dte_left = (dt.date.fromisoformat(s["expiry"]) - dt.date.fromisoformat(today)).days
         exit_dte = EXIT_DTE_ALL_LONG if all(l["side"] == "BUY" for l in s["legs"]) else EXIT_DTE
-        # mark: sum of leg (market - entry) * sign
+        # mark-to-market vs BROKER-TRUE entry basis (fill_price from reconcile)
         pnl = 0.0
         marks_ok = True
         for leg in s["legs"]:
             p = by_code.get(leg["code"])
             mark = float(p["nominal_price"]) if p is not None and pd.notna(p.get("nominal_price")) else None
-            if mark is None:
+            if mark is None or mark <= 0:
                 marks_ok = False; break
             sign = 1.0 if leg["side"] == "BUY" else -1.0
-            pnl += sign * (mark - leg["entry_mid"])
+            basis = leg.get("fill_price") or leg["entry_mid"]
+            pnl += sign * (mark - basis)
         rule = MANAGEMENT.get(s["strategy"], DEFAULT_RULE)
         base = s.get("max_profit")
         # straddles have no defined max profit -- trail off the entry debit
         trail_base = base if (base and base > 0) else abs(s.get("net_debit_credit") or 0) or None
         if marks_ok and trail_base:
-            if pnl > (s.get("peak_pnl") or -1e9):
+            prev = s.get("peak_pnl")
+            if prev is None or pnl > prev:
                 s["peak_pnl"] = round(pnl, 3)
         peak = s.get("peak_pnl")
         reason = None
@@ -181,13 +275,8 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
                 reason = "breakeven stop (winner faded)"
         if reason is None:
             continue
-        # close: opposite side per leg, limit at current mark
-        for leg in s["legs"]:
-            p = by_code.get(leg["code"])
-            mark = float(p["nominal_price"]) if p is not None and pd.notna(p.get("nominal_price")) else leg["entry_mid"]
-            side = "SELL" if leg["side"] == "BUY" else "BUY"
-            broker.place_limit(leg["code"], leg["qty"], side, mark,
-                               note=f"EXIT {s['id']}: {reason}")
+        snap = _live_snapshot([l["code"] for l in s["legs"]])
+        _close_legs(broker, s, s["legs"], reason, bqty, snap)
         s["status"] = "CLOSING"
         s["exit_reason"] = reason
         s["exit_date"] = today
@@ -205,6 +294,7 @@ def reconcile(broker, structs: list[dict]) -> list[str]:
         pos = broker.positions()
     except Exception as e:  # noqa: BLE001
         return [f"- reconcile skipped: {e}"]
+    today = dt.date.today().isoformat()
     cost = {str(p["code"]): float(p["cost_price"]) for _, p in pos.iterrows()}
     bqty = {str(p["code"]): float(p["qty"]) for _, p in pos.iterrows() if abs(p["qty"]) > 0}
     lqty: dict[str, float] = {}
@@ -214,7 +304,10 @@ def reconcile(broker, structs: list[dict]) -> list[str]:
         net = 0.0
         for leg in s["legs"]:
             sign = 1 if leg["side"] == "BUY" else -1
-            lqty[leg["code"]] = lqty.get(leg["code"], 0) + sign * leg["qty"]
+            # qty check only for SETTLED structures: today's entries are still
+            # filling and CLOSING has exits in flight -- flagging them is noise
+            if s["status"] == "OPEN" and s["entry_date"] < today:
+                lqty[leg["code"]] = lqty.get(leg["code"], 0) + sign * leg["qty"]
             if leg["code"] in cost and cost[leg["code"]] > 0:
                 actual = cost[leg["code"]]
                 if abs(actual - (leg.get("fill_price") or leg["entry_mid"])) >= 0.01:
@@ -222,11 +315,123 @@ def reconcile(broker, structs: list[dict]) -> list[str]:
                                  f"{leg.get('fill_price') or leg['entry_mid']} -> broker {actual}")
                 leg["fill_price"] = actual
             net += sign * (leg.get("fill_price") or leg["entry_mid"])
-        s["net_entry_actual"] = round(net, 2)
-    for c in set(lqty) | set(bqty):
+        # store in the strategist's sign convention (credit positive)
+        s["net_entry_actual"] = round(-net, 2)
+    for c in lqty:
         if abs(lqty.get(c, 0) - bqty.get(c, 0)) >= 0.5:
             lines.append(f"- QTY MISMATCH {c}: ledger {lqty.get(c, 0):+g} vs broker {bqty.get(c, 0):+g}")
     return lines or ["- reconciled clean: fills and quantities match broker"]
+
+
+# expected leg counts per strategy: a partial signals row-set must never
+# become a live incomplete structure (e.g. a 3-legged "condor")
+EXPECTED_LEGS = {
+    "Iron Condor": 4, "Call Debit Spread": 2, "Put Debit Spread": 2,
+    "Bull Put Spread (credit)": 2, "Bear Call Spread (credit)": 2,
+    "Long Straddle": 2, "Collar": 2, "Cash-Secured Put": 1, "Covered Call": 1,
+}
+
+
+def do_entries(broker, structs, journal, sig_path, budget, today) -> int:
+    n_open = sum(1 for s in structs if s["status"] in ("OPEN", "CLOSING"))
+    open_unders = {s["underlying"] for s in structs if s["status"] in ("OPEN", "CLOSING")}
+    existing_ids = {s["id"] for s in structs}
+    # per-DAY cap from the ledger, not per-run (manual + scheduled same day)
+    placed = sum(1 for s in structs if s.get("entry_date") == today
+                 and s["status"] not in ("CANCELLED_UNFILLED", "ABORTED_ENTRY"))
+    if not sig_path.exists():
+        journal.append(f"- no signal file for {today} (market holiday or recorder gap)")
+        return 0
+    try:
+        sig = pd.read_csv(sig_path)
+        if sig.empty or "code" not in sig.columns:
+            raise ValueError("empty")
+    except Exception:  # noqa: BLE001 - empty/corrupt CSV must not kill the run
+        journal.append("- signals file empty or unreadable -- no entries today")
+        return 0
+    capital_in_use = sum(s.get("capital", 0.0) for s in structs
+                         if s["status"] in ("OPEN", "CLOSING"))
+    # rank candidates by model EV per unit risk, best first (was alphabetical)
+    groups = sorted(structure_groups(sig),
+                    key=lambda t: -((t[2]["ev_per_share"].iloc[0] or 0)
+                                    / max(t[2]["max_loss"].iloc[0] or 1e9, 0.01)))
+    entered = 0
+    for code, strat, legs in groups:
+        if placed >= MAX_NEW_PER_DAY or n_open + entered >= MAX_OPEN_STRUCTURES:
+            journal.append("- caps reached; remaining signals skipped")
+            break
+        if code in open_unders:
+            continue                    # one structure per underlying
+        if EXPECTED_LEGS.get(strat) is not None and len(legs) != EXPECTED_LEGS[strat]:
+            journal.append(f"- skip {code} {strat}: {len(legs)} legs in signals, "
+                           f"expected {EXPECTED_LEGS[strat]} (partial row-set)")
+            continue
+        sid = f"{today}-{code}-{strat}".replace(" ", "_")
+        if sid in existing_ids:
+            continue                    # same-day re-entry after a close: skip
+        row0 = legs.iloc[0]
+        net = float(row0["net_debit_credit"]) if pd.notna(row0["net_debit_credit"]) else None
+        max_loss = float(row0["max_loss"]) if pd.notna(row0["max_loss"]) else None
+        leg_meta = [{"strike": float(l["leg_strike"])} for _, l in legs.iterrows()]
+        n_contracts, capital, why = size_structure(budget, strat, leg_meta, net,
+                                                   max_loss, capital_in_use)
+        if n_contracts < 1:
+            journal.append(f"- skip {code} {strat}: {why}")
+            continue
+        leg_recs, rejected = [], False
+        for _, leg in legs.iterrows():
+            m = _mid(leg)
+            res = broker.place_limit(leg["leg_code"], n_contracts,
+                                     leg["leg_action"].upper(), m,
+                                     note=f"ENTRY {sid}")
+            if res.get("status") == "REJECTED":
+                rejected = True
+            leg_recs.append({
+                "code": leg["leg_code"], "side": leg["leg_action"].upper(), "qty": n_contracts,
+                "right": leg["leg_right"], "strike": float(leg["leg_strike"]),
+                "entry_mid": round(m, 2), "theo": round(float(leg["theo_bsm"]), 2) if pd.notna(leg["theo_bsm"]) else None,
+                "bid": float(leg["bid"]), "ask": float(leg["ask"]),
+                "order_status": res.get("status"), "order_id": res.get("order_id"),
+            })
+        # max profit: credit = the credit; VERTICALS (one buy + one sell) =
+        # width - debit. All-long 2-leg structures (straddle) have none.
+        max_profit = None
+        if net is not None and net > 0:
+            max_profit = net
+        elif net is not None and len(leg_recs) == 2 \
+                and {l["side"] for l in leg_recs} == {"BUY", "SELL"}:
+            width = abs(leg_recs[0]["strike"] - leg_recs[1]["strike"])
+            max_profit = width - abs(net) if width - abs(net) > 0 else None
+        rec = {
+            "id": sid, "underlying": code, "strategy": strat, "status": "OPEN",
+            "entry_date": today, "expiry": str(row0["expiry"]), "dte": int(row0["dte"]),
+            "pop_pct": float(row0["pop_pct"]) if pd.notna(row0["pop_pct"]) else None,
+            "ev_per_share": float(row0["ev_per_share"]) if pd.notna(row0["ev_per_share"]) else None,
+            "net_debit_credit": net, "max_loss": max_loss, "max_profit": max_profit,
+            "contracts": n_contracts, "capital": round(capital, 2),
+            "legs": leg_recs,
+        }
+        if rejected:
+            # abort: cancel the sibling orders that did submit; hold no capital
+            for lr in leg_recs:
+                if lr.get("order_id") and lr.get("order_status") == "SUBMITTED":
+                    broker.cancel_order(lr["order_id"])
+            rec["status"] = "ABORTED_ENTRY"
+            rec["capital"] = 0.0
+            structs.append(rec)
+            journal.append(f"- ABORT {code} {strat}: a leg was rejected; siblings cancelled")
+            continue
+        structs.append(rec)
+        existing_ids.add(sid)
+        capital_in_use += capital
+        open_unders.add(code)
+        placed += 1
+        entered += 1
+        journal.append(f"- ENTER {code} {strat}: {n_contracts}x {len(leg_recs)} leg(s) at mid, "
+                       f"capital ~${capital:,.0f} (POP {row0['pop_pct']}%, EV {row0['ev_per_share']})")
+    if entered == 0:
+        journal.append("- no new structures entered")
+    return entered
 
 
 def main() -> None:
@@ -240,142 +445,100 @@ def main() -> None:
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
     structs = _load_structures()
     journal: list[str] = []
-
-    broker = PaperBroker().connect()
-    acc = broker.account()
-    equity = float(acc.iloc[0]["total_assets"]) if "total_assets" in acc.columns else None
-
-    # 1. exits
-    journal.append("## Exits")
-    journal += check_exits(broker, structs, today) or ["- none"]
-
-    # 2. cancel stale unfilled entry orders (failed-fill datapoints)
-    journal.append("\n## Order hygiene")
-    try:
-        from moomoo import OrderStatus
-        open_orders = broker.orders(status_filter_list=[
-            OrderStatus.SUBMITTED, OrderStatus.WAITING_SUBMIT, OrderStatus.SUBMITTING])
-        stale = open_orders[open_orders.get("create_time", "").astype(str).str[:10] < today] \
-            if not open_orders.empty else open_orders
-        n_cancel = 0
-        if not stale.empty:
-            for _, o in stale.iterrows():
-                if broker.cancel_order(str(o["order_id"])):
-                    n_cancel += 1
-        journal.append(f"- cancelled {n_cancel} stale unfilled order(s) -- logged as failed fills")
-    except Exception as e:  # noqa: BLE001
-        journal.append(f"- hygiene skipped ({e})")
-
-    # 3. entries
-    journal.append("\n## Entries")
-    n_open = sum(1 for s in structs if s["status"] in ("OPEN", "CLOSING"))
-    open_unders = {s["underlying"] for s in structs if s["status"] in ("OPEN", "CLOSING")}
+    exit_code = 0
+    broker = None
     placed = 0
-    if not sig_path.exists():
-        journal.append(f"- no signal file for {today} (market holiday or recorder gap)")
-    else:
-        sig = pd.read_csv(sig_path)
-        capital_in_use = sum(s.get("capital", 0.0) for s in structs
-                             if s["status"] in ("OPEN", "CLOSING"))
-        for code, strat, legs in structure_groups(sig):
-            if placed >= MAX_NEW_PER_DAY or n_open + placed >= MAX_OPEN_STRUCTURES:
-                journal.append("- caps reached; remaining signals skipped")
-                break
-            if code in open_unders:
-                continue                    # one structure per underlying
-            sid = f"{today}-{code}-{strat}".replace(" ", "_")
-            row0 = legs.iloc[0]
-            net = float(row0["net_debit_credit"]) if pd.notna(row0["net_debit_credit"]) else None
-            max_loss = float(row0["max_loss"]) if pd.notna(row0["max_loss"]) else None
-            leg_meta = [{"strike": float(l["leg_strike"])} for _, l in legs.iterrows()]
-            n_contracts, capital, why = size_structure(budget, strat, leg_meta, net,
-                                                       max_loss, capital_in_use)
-            if n_contracts < 1:
-                journal.append(f"- skip {code} {strat}: {why}")
-                continue
-            leg_recs = []
-            for _, leg in legs.iterrows():
-                m = _mid(leg)
-                res = broker.place_limit(leg["leg_code"], n_contracts,
-                                         leg["leg_action"].upper(), m,
-                                         note=f"ENTRY {sid}")
-                leg_recs.append({
-                    "code": leg["leg_code"], "side": leg["leg_action"].upper(), "qty": n_contracts,
-                    "right": leg["leg_right"], "strike": float(leg["leg_strike"]),
-                    "entry_mid": round(m, 2), "theo": round(float(leg["theo_bsm"]), 2) if pd.notna(leg["theo_bsm"]) else None,
-                    "bid": float(leg["bid"]), "ask": float(leg["ask"]),
-                    "order_status": res.get("status"), "order_id": res.get("order_id"),
-                })
-            capital_in_use += capital
-            # max profit: credit structures = credit; 2-leg verticals = width - debit
-            max_profit = None
-            if net is not None and net > 0:
-                max_profit = net
-            elif net is not None and len(leg_recs) == 2:
-                width = abs(leg_recs[0]["strike"] - leg_recs[1]["strike"])
-                max_profit = width - abs(net)
-            structs.append({
-                "id": sid, "underlying": code, "strategy": strat, "status": "OPEN",
-                "entry_date": today, "expiry": str(row0["expiry"]), "dte": int(row0["dte"]),
-                "pop_pct": float(row0["pop_pct"]) if pd.notna(row0["pop_pct"]) else None,
-                "ev_per_share": float(row0["ev_per_share"]) if pd.notna(row0["ev_per_share"]) else None,
-                "net_debit_credit": net, "max_loss": max_loss, "max_profit": max_profit,
-                "contracts": n_contracts, "capital": round(capital, 2),
-                "legs": leg_recs,
-            })
-            open_unders.add(code)
-            placed += 1
-            journal.append(f"- ENTER {code} {strat}: {n_contracts}x {len(leg_recs)} leg(s) at mid, "
-                           f"capital ~${capital:,.0f} (POP {row0['pop_pct']}%, EV {row0['ev_per_share']})")
-        if placed == 0 and sig_path.exists():
-            journal.append("- no structures passed criteria today")
+    equity = None
 
-    # post-session counter-check: broker truth beats our order records
-    journal.append("\n## Reconciliation (broker truth)")
-    journal += reconcile(broker, structs)
+    try:
+        broker = PaperBroker().connect()
+        acc = broker.account()
+        equity = float(acc.iloc[0]["total_assets"]) if "total_assets" in acc.columns else None
 
-    _save_structures(structs)
+        # 1. hygiene: cancel stale unfilled orders (failed-fill datapoints).
+        # Runs FIRST so lifecycle/exits can re-place fresh orders after it.
+        journal.append("## Order hygiene")
+        try:
+            from moomoo import OrderStatus
+            open_orders = broker.orders(status_filter_list=[
+                OrderStatus.SUBMITTED, OrderStatus.WAITING_SUBMIT, OrderStatus.SUBMITTING])
+            stale = open_orders[open_orders.get("create_time", "").astype(str).str[:10] < today] \
+                if not open_orders.empty else open_orders
+            n_cancel = 0
+            if not stale.empty:
+                for _, o in stale.iterrows():
+                    if broker.cancel_order(str(o["order_id"])):
+                        n_cancel += 1
+            journal.append(f"- cancelled {n_cancel} stale unfilled order(s)")
+        except Exception as e:  # noqa: BLE001
+            journal.append(f"- hygiene skipped ({e})")
 
-    # 4. journal note (Obsidian-ready) + dashboard
+        # 2. lifecycle sync: CANCELLED_UNFILLED / BROKEN / CLOSED transitions
+        # and crossing-price retries for CLOSING structures
+        journal.append("\n## Lifecycle sync")
+        journal += sync_lifecycle(broker, structs, today) or ["- all states consistent"]
+        _save_structures(structs)
+
+        # 3. rule-based exits
+        journal.append("\n## Exits")
+        journal += check_exits(broker, structs, today) or ["- none"]
+        _save_structures(structs)
+
+        # 4. entries (EV-ranked, per-day capped, leg-validated)
+        journal.append("\n## Entries")
+        placed = do_entries(broker, structs, journal, sig_path, budget, today)
+        _save_structures(structs)
+
+        # 5. reconciliation: broker truth beats our order records
+        journal.append("\n## Reconciliation (broker truth)")
+        journal += reconcile(broker, structs)
+        _save_structures(structs)
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        journal.append(f"\n## RUN ERROR\n- {e}\n```\n{traceback.format_exc()}\n```")
+        _save_structures(structs)
+        exit_code = 1
+
+    # 6. journal note (Obsidian-ready) + dashboard -- always written
     n_open_now = sum(1 for s in structs if s["status"] in ("OPEN", "CLOSING"))
+    closing = [s for s in structs if s["status"] == "CLOSING"]
+    eq_s = f"{equity:,.0f}" if equity is not None else "n/a"
     note = JOURNAL_DIR / f"{today}.md"
     front = (f"---\ndate: {today}\ntype: paper-journal\nentries_placed: {placed}\n"
-             f"open_structures: {n_open_now}\npaper_equity: {equity}\n---\n")
+             f"open_structures: {n_open_now}\npaper_equity: {equity if equity is not None else 'null'}\n---\n")
     body = (f"# Paper journal — {today}\n\n"
-            f"Paper account equity: **{equity:,.0f}** · open structures: **{n_open_now}**\n\n"
-            + "\n".join(journal) + "\n\n"
-            f"[[Dashboard]]\n")
+            f"Paper account equity: **{eq_s}** · open structures: **{n_open_now}**\n\n"
+            + "\n".join(journal) + "\n\n[[Dashboard]]\n")
     note.write_text(front + body, encoding="utf-8")
 
-    closed = [s for s in structs if s["status"] == "CLOSING"]
     dash = JOURNAL_DIR / "Dashboard.md"
+    closed_all = [s for s in structs if s["status"] in ("CLOSED", "CLOSING", "CANCELLED_UNFILLED", "ABORTED_ENTRY")]
     dash.write_text(
         "---\ntype: paper-dashboard\n---\n# Paper Trading Dashboard\n\n"
-        f"Updated: {today}\n\n"
-        f"- Paper equity: **{equity:,.0f}**\n"
+        f"Updated: {today}\n\n- Paper equity: **{eq_s}**\n"
         f"- Open structures: **{n_open_now}**\n"
         f"- Structures ever entered: **{len(structs)}**\n"
-        f"- Closed/closing: **{len(closed)}**\n\n"
+        f"- Closed / closing / cancelled: **{len(closed_all)}**\n\n"
         "## Recent daily notes\n"
         + "\n".join(f"- [[{p.stem}]]" for p in sorted(JOURNAL_DIR.glob('2*.md'), reverse=True)[:15])
-        + "\n\nLedger: `data_store/paper/structures.jsonl` · orders: `data_store/paper/order_ledger.jsonl`\n",
+        + "\n\nInteractive charts: `dashboard.html` · ledgers in `data_store/paper/`\n",
         encoding="utf-8")
 
-    # equity snapshot + dashboard refresh (best-effort; never blocks the run)
     try:
         from scripts.build_dashboard import build, snapshot_equity
-        cash = float(acc.iloc[0]["cash"]) if "cash" in acc.columns else None
         if equity is not None:
+            cash = float(acc.iloc[0]["cash"]) if "cash" in acc.columns else None
             snapshot_equity(equity, cash)
         build()
     except Exception as e:  # noqa: BLE001
         print(f"dashboard refresh failed: {e}")
 
-    print(f"{today}: {placed} entered, {len(closed)} closing, {n_open_now} open -> {note}")
-    broker.close()
+    print(f"{today}: {placed} entered, {len(closing)} closing, {n_open_now} open -> {note}")
+    if broker is not None:
+        broker.close()
     sys.stdout.flush()
     import os
-    os._exit(0)
+    os._exit(exit_code)   # ALWAYS hard-exit: moomoo threads must never hang the task
 
 
 if __name__ == "__main__":

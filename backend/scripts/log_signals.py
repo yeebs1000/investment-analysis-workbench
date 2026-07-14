@@ -92,17 +92,23 @@ def main() -> None:
             ta = technical.analyze(code, code, bars)
             if ta.error or ta.decision is None:
                 raise ValueError(f"technical: {ta.error or 'no decision'}")
+            # GARCH steps in TRADING days but dte is CALENDAR: precompute the
+            # forecast at the trading-day equivalent so the IV regime read
+            # matches the validated tenor (49 cal ~ 34 trading)
+            fv = options_math.forecast_vol_garch(bars, max(1, int(round(dte * 252 / 365))))
             res = opt.build_analysis(
                 code=code, name=code, as_of=day, spot=spot,
                 decision=ta.decision, score=ta.score, bars=bars,
                 contracts=trade_ch, expiry=expiry, dte=dte, holds=False, shares=0.0,
-                confidence=ta.confidence, market_regime=market_regime)
+                confidence=ta.confidence, market_regime=market_regime,
+                forecast_vol_pct=fv if fv is not None else -1.0)
             snap = ch.set_index("code")
+            sym_rows = []   # buffer per symbol: partial structures must never reach the CSV
             for s in res.strategies:
                 for leg in s.legs:
                     q = snap.loc[leg.code] if leg.code in snap.index else None
                     theo = options_math.bsm_price(spot, leg.strike, leg.iv_pct, dte, leg.right)
-                    rows.append({
+                    sym_rows.append({
                         "date": day, "code": code, "spot": spot, "expiry": expiry, "dte": dte,
                         "decision": ta.decision.value, "confidence": ta.confidence,
                         "strategy": s.name, "direction": s.direction,
@@ -116,6 +122,7 @@ def main() -> None:
                         "oi": (float(q["oi"]) if q is not None and pd.notna(q["oi"]) else None),
                         "n_tradeable": len(trade_ch), "n_chain": len(ch),
                     })
+            rows.extend(sym_rows)   # only complete symbols reach the CSV
             print(f"  {code}: {len(res.strategies)} structure(s)", flush=True)
         except Exception as e:  # noqa: BLE001 - one bad symbol never kills the log
             print(f"  {f.stem}: SKIP ({e})", flush=True)
