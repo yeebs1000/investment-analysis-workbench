@@ -377,13 +377,19 @@ def chase_entry_fills(broker, structs, today, walk_frac=0.5) -> list[str]:
     return lines or ["- resting entries already at market"]
 
 
-def do_entries(broker, structs, journal, sig_path, budget, today) -> int:
+def do_entries(broker, structs, journal, sig_path, budget, today, max_new=None) -> int:
+    # --max-new (explicitly passed) marks a DISTINCT session: reset the
+    # allowance to 0. Needed because the ~12h local/ET offset makes one local
+    # date span two US sessions, and the default per-day ledger count would
+    # otherwise carry the prior session's entries into this one.
+    session_reset = max_new is not None
+    cap = max_new if max_new is not None else MAX_NEW_PER_DAY
     n_open = sum(1 for s in structs if s["status"] in ("OPEN", "CLOSING"))
     open_unders = {s["underlying"] for s in structs if s["status"] in ("OPEN", "CLOSING")}
     existing_ids = {s["id"] for s in structs}
-    # per-DAY cap from the ledger, not per-run (manual + scheduled same day)
-    placed = sum(1 for s in structs if s.get("entry_date") == today
-                 and s["status"] not in ("CANCELLED_UNFILLED", "ABORTED_ENTRY"))
+    placed = 0 if session_reset else sum(
+        1 for s in structs if s.get("entry_date") == today
+        and s["status"] not in ("CANCELLED_UNFILLED", "ABORTED_ENTRY"))
     if not sig_path.exists():
         journal.append(f"- no signal file for {today} (market holiday or recorder gap)")
         return 0
@@ -402,7 +408,7 @@ def do_entries(broker, structs, journal, sig_path, budget, today) -> int:
                                     / max(t[2]["max_loss"].iloc[0] or 1e9, 0.01)))
     entered = 0
     for code, strat, legs in groups:
-        if placed >= MAX_NEW_PER_DAY or n_open + entered >= MAX_OPEN_STRUCTURES:
+        if placed >= cap or n_open + entered >= MAX_OPEN_STRUCTURES:
             journal.append("- caps reached; remaining signals skipped")
             break
         if code in open_unders:
@@ -485,6 +491,7 @@ def main() -> None:
     budget = None
     if "--budget" in sys.argv:
         budget = float(sys.argv[sys.argv.index("--budget") + 1])
+    max_new = int(sys.argv[sys.argv.index("--max-new") + 1]) if "--max-new" in sys.argv else None
     today = dt.date.today().isoformat()
     sig_path = SIGNALS_DIR / f"{today}.csv"
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -535,7 +542,7 @@ def main() -> None:
 
         # 5. entries (EV-ranked, per-day capped, leg-validated)
         journal.append("\n## Entries")
-        placed = do_entries(broker, structs, journal, sig_path, budget, today)
+        placed = do_entries(broker, structs, journal, sig_path, budget, today, max_new)
         _save_structures(structs)
 
         # 5. reconciliation: broker truth beats our order records
