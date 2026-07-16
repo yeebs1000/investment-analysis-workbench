@@ -50,12 +50,12 @@ def area_chart(dates: list[str], ys: list[float], ref: float | None,
     py = lambda v: pt + (hi - v) / span * (h - pt - pb)
     pts = " ".join(f"{px(i):.1f},{py(v):.1f}" for i, v in enumerate(ys))
     up = ys[-1] >= (ref if ref else ys[0])
-    col = POS if up else NEG
+    col = "var(--pos)" if up else "var(--neg)"
     area = f"{px(0):.1f},{h-pb} {pts} {px(len(ys)-1):.1f},{h-pb}"
     grid = lab = ""
     for k in range(5):
         v = lo + span * k / 4; y = py(v)
-        grid += f'<line x1="{pl}" y1="{y:.1f}" x2="{w-pr}" y2="{y:.1f}" stroke="{LINE}" stroke-width="1"/>'
+        grid += f'<line x1="{pl}" y1="{y:.1f}" x2="{w-pr}" y2="{y:.1f}" stroke="var(--line)" stroke-width="1"/>'
         lab += (f'<text x="{pl-10}" y="{y+3.5:.1f}" text-anchor="end" class="axis">'
                 f'{v/1000:,.1f}k</text>')
     step = max(1, len(dates) // 7)
@@ -64,13 +64,13 @@ def area_chart(dates: list[str], ys: list[float], ref: float | None,
     refline = ""
     if ref is not None:
         refline = (f'<line x1="{pl}" y1="{py(ref):.1f}" x2="{w-pr}" y2="{py(ref):.1f}" '
-                   f'stroke="{FAINT}" stroke-width="1" stroke-dasharray="3 4"/>'
+                   f'stroke="var(--faint)" stroke-width="1" stroke-dasharray="3 4"/>'
                    f'<text x="{w-pr}" y="{py(ref)-6:.1f}" text-anchor="end" class="axis">start</text>')
     ex, ey = px(len(ys)-1), py(ys[-1])
     length = 2000
     return f"""<svg viewBox="0 0 {w} {h}" class="equity" preserveAspectRatio="none" role="img" aria-label="equity curve">
 <defs><linearGradient id="eg" x1="0" y1="0" x2="1" y2="0">
-<stop offset="0" stop-color="{ACCENT}"/><stop offset="1" stop-color="{ACCENT2}"/></linearGradient>
+<stop offset="0" stop-color="var(--accent)"/><stop offset="1" stop-color="var(--accent2)"/></linearGradient>
 <linearGradient id="efade" x1="0" y1="0" x2="0" y2="1">
 <stop offset="0" stop-color="#fff" stop-opacity="0.55"/>
 <stop offset="0.6" stop-color="#fff" stop-opacity="0.14"/>
@@ -86,7 +86,7 @@ def area_chart(dates: list[str], ys: list[float], ref: float | None,
  stroke-linecap="round" class="eqline" style="stroke-dasharray:{length};stroke-dashoffset:{length}"/>
 <circle cx="{ex:.1f}" cy="{ey:.1f}" r="9" fill="{col}" class="pulse" filter="url(#glow)"/>
 <circle cx="{ex:.1f}" cy="{ey:.1f}" r="4.5" fill="{col}"/>
-<circle cx="{ex:.1f}" cy="{ey:.1f}" r="2.6" fill="{BG}"/><circle cx="{ex:.1f}" cy="{ey:.1f}" r="1.4" fill="{INK}"/>
+<circle cx="{ex:.1f}" cy="{ey:.1f}" r="2.6" fill="var(--bg)"/><circle cx="{ex:.1f}" cy="{ey:.1f}" r="1.4" fill="var(--ink)"/>
 {lab}</svg>"""
 
 
@@ -109,9 +109,9 @@ def gauge(frac: float, sub: str) -> str:
     a0 = math.pi; a1 = math.pi * (1 - frac)
     x0, y0 = cx + r*math.cos(a0), cy - r*math.sin(a0)
     x1, y1 = cx + r*math.cos(a1), cy - r*math.sin(a1)
-    col = ACCENT if frac < 0.8 else NEG
+    col = "var(--accent)" if frac < 0.8 else "var(--neg)"
     return (f'<svg viewBox="0 0 {w} 96" class="gauge">'
-            f'<path d="M {x0:.1f} {y0:.1f} A {r} {r} 0 0 1 {cx+r} {cy}" stroke="{LINE}" stroke-width="9" fill="none" stroke-linecap="round"/>'
+            f'<path d="M {x0:.1f} {y0:.1f} A {r} {r} 0 0 1 {cx+r} {cy}" stroke="var(--line)" stroke-width="9" fill="none" stroke-linecap="round"/>'
             f'<path d="M {x0:.1f} {y0:.1f} A {r} {r} 0 {1 if frac>0.5 else 0} 1 {x1:.1f} {y1:.1f}" stroke="{col}" stroke-width="9" fill="none" stroke-linecap="round" class="g-arc" style="--gc:{col}"/>'
             f'<text x="{cx}" y="{cy-6}" text-anchor="middle" class="g-big">{frac*100:.0f}%</text>'
             f'<text x="{cx}" y="{cy+12}" text-anchor="middle" class="g-sub">{html.escape(sub)}</text></svg>')
@@ -232,6 +232,7 @@ def build() -> Path:
 
     head = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>Paper Book · {money(cur_eq)}</title><style>{CSS}</style></head><body>"""
 
     body = f"""
@@ -343,76 +344,97 @@ def snapshot_equity(equity: float, cash: float) -> None:
     df.to_csv(eq_path, index=False)
 
 
-CSS = """
+CSS = f""":root{{
+  color-scheme:light dark;
+  --bg:{BG};--panel:{PANEL};--panel2:{PANEL2};--panel-grad:rgba(16,23,37,.72);
+  --line:{LINE};--ink:{INK};--muted:{MUTED};--faint:{FAINT};
+  --pos:{POS};--neg:{NEG};--accent:{ACCENT};--accent2:{ACCENT2};
+  --pos-dim:{POS_DIM};--neg-dim:{NEG_DIM};
+  --grid:rgba(36,50,68,.35);--bar-bg:rgba(8,10,18,.72);
+  --panel-shadow:0 24px 50px -34px rgba(0,0,0,.9);
+  --glow-eq:0 0 18px rgba(244,247,255,.25);--glow-v:0 0 16px rgba(244,247,255,.14);
+  --glow-pos:0 0 18px rgba(51,232,160,.55);--glow-neg:0 0 18px rgba(255,93,115,.5);
+  --row-hover:rgba(47,242,223,.05);
+}}
+@media (prefers-color-scheme:light){{:root{{
+  --bg:#eef2f7;--panel:#ffffff;--panel2:#eff3fa;--panel-grad:#f6f9fe;
+  --line:#dce3ef;--ink:#0f1826;--muted:#55617a;--faint:#94a0b4;
+  --pos:#0c7a4f;--neg:#cf2740;--accent:#0a8f83;--accent2:#6a44d6;
+  --pos-dim:#d7f3e6;--neg-dim:#fbe0e4;
+  --grid:rgba(120,140,170,.26);--bar-bg:rgba(255,255,255,.78);
+  --panel-shadow:0 18px 40px -30px rgba(30,50,90,.28);
+  --glow-eq:none;--glow-v:none;--glow-pos:none;--glow-neg:none;
+  --row-hover:rgba(10,143,131,.08);
+}}}}
+""" + """
 *{box-sizing:border-box;margin:0}
-:root{color-scheme:dark}
-body{background:%(BG)s;color:%(INK)s;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+body{background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
   font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased;padding-bottom:3rem;position:relative}
 /* HUD backdrop: top-corner cyan/violet auras + faint blueprint grid */
 body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
   background:
-    radial-gradient(900px 520px at 8%% -8%%, rgba(47,242,223,.10), transparent 60%%),
-    radial-gradient(820px 520px at 100%% -12%%, rgba(157,123,255,.12), transparent 62%%),
-    linear-gradient(rgba(36,50,68,.35) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(36,50,68,.35) 1px, transparent 1px);
-  background-size:100%% 100%%,100%% 100%%,44px 44px,44px 44px;
-  -webkit-mask-image:linear-gradient(180deg,#000,rgba(0,0,0,.65) 40%%,transparent 92%%);
-  mask-image:linear-gradient(180deg,#000,rgba(0,0,0,.65) 40%%,transparent 92%%)}
+    radial-gradient(900px 520px at 8% -8%, rgba(47,242,223,.10), transparent 60%),
+    radial-gradient(820px 520px at 100% -12%, rgba(157,123,255,.12), transparent 62%),
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size:100% 100%,100% 100%,44px 44px,44px 44px;
+  -webkit-mask-image:linear-gradient(180deg,#000,rgba(0,0,0,.65) 40%,transparent 92%);
+  mask-image:linear-gradient(180deg,#000,rgba(0,0,0,.65) 40%,transparent 92%)}
 .mono{font-family:ui-monospace,"SF Mono","Cascadia Code","Roboto Mono",Consolas,monospace;font-variant-numeric:tabular-nums}
-h2{font-size:.8rem;font-weight:600;letter-spacing:.02em;color:%(INK)s;text-transform:uppercase}
+h2{font-size:.8rem;font-weight:600;letter-spacing:.02em;color:var(--ink);text-transform:uppercase}
 main{max-width:1180px;margin:0 auto;padding:1.25rem 1.25rem 0}
 
 /* top bar */
 .bar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:1.25rem;
-  padding:.75rem 1.25rem;background:rgba(8,10,18,.72);backdrop-filter:blur(14px) saturate(1.3);
+  padding:.75rem 1.25rem;background:var(--bar-bg);backdrop-filter:blur(14px) saturate(1.3);
   border-bottom:1px solid transparent;
-  border-image:linear-gradient(90deg,%(ACCENT)s,%(ACCENT2)s) 1;
+  border-image:linear-gradient(90deg,var(--accent),var(--accent2)) 1;
   box-shadow:0 1px 0 rgba(47,242,223,.18),0 14px 40px -22px rgba(47,242,223,.5)}
 .brand{display:flex;align-items:center;gap:.55rem;font-size:1rem;font-weight:600;letter-spacing:.01em}
-.brand .dot{width:9px;height:9px;border-radius:50%%;background:%(ACCENT)s;
-  box-shadow:0 0 10px %(ACCENT)s,0 0 20px rgba(47,242,223,.6);animation:beat 2.6s ease-in-out infinite}
-.env{font-size:.6rem;font-weight:600;letter-spacing:.14em;color:%(ACCENT)s;
+.brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);
+  box-shadow:0 0 10px var(--accent),0 0 20px rgba(47,242,223,.6);animation:beat 2.6s ease-in-out infinite}
+.env{font-size:.6rem;font-weight:600;letter-spacing:.14em;color:var(--accent);
   border:1px solid rgba(47,242,223,.4);background:rgba(47,242,223,.08);
   padding:.14rem .5rem;border-radius:5px;margin-left:.15rem;text-shadow:0 0 10px rgba(47,242,223,.6)}
 .bar-eq{margin-left:auto;display:flex;align-items:baseline;gap:.75rem}
-.bar-eq .eq{font-size:1.3rem;font-weight:700;letter-spacing:-.01em;text-shadow:0 0 18px rgba(244,247,255,.25)}
+.bar-eq .eq{font-size:1.3rem;font-weight:700;letter-spacing:-.01em;text-shadow:var(--glow-eq)}
 .bar-eq .delta{font-size:.85rem;font-weight:600}
-.upd{color:%(FAINT)s;font-size:.72rem;min-width:9ch;text-align:right;letter-spacing:.02em}
+.upd{color:var(--faint);font-size:.72rem;min-width:9ch;text-align:right;letter-spacing:.02em}
 
 /* kpi strip */
 .kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;
   background:linear-gradient(90deg,rgba(47,242,223,.28),rgba(157,123,255,.28));
   border-radius:14px;overflow:hidden;margin:1.2rem 0;
   box-shadow:0 20px 50px -30px rgba(47,242,223,.55)}
-.kpi{background:%(PANEL)s;padding:.95rem 1.1rem;display:flex;flex-direction:column;gap:.32rem;
+.kpi{background:var(--panel);padding:.95rem 1.1rem;display:flex;flex-direction:column;gap:.32rem;
   position:relative;transition:background .15s ease}
-.kpi:hover{background:%(PANEL2)s}
-.kpi .k{font-size:.66rem;letter-spacing:.09em;color:%(MUTED)s;text-transform:uppercase}
-.kpi .v{font-size:1.7rem;font-weight:700;line-height:1;letter-spacing:-.01em;text-shadow:0 0 16px rgba(244,247,255,.14)}
-.kpi .sub{font-size:.7rem;color:%(FAINT)s}
+.kpi:hover{background:var(--panel2)}
+.kpi .k{font-size:.66rem;letter-spacing:.09em;color:var(--muted);text-transform:uppercase}
+.kpi .v{font-size:1.7rem;font-weight:700;line-height:1;letter-spacing:-.01em;text-shadow:var(--glow-v)}
+.kpi .sub{font-size:.7rem;color:var(--faint)}
 
-.pos{color:%(POS)s}.neg{color:%(NEG)s}.flat{color:%(MUTED)s}
-.v.pos{text-shadow:0 0 18px rgba(51,232,160,.55)}
-.v.neg{text-shadow:0 0 18px rgba(255,93,115,.5)}
+.pos{color:var(--pos)}.neg{color:var(--neg)}.flat{color:var(--muted)}
+.v.pos{text-shadow:var(--glow-pos)}
+.v.neg{text-shadow:var(--glow-neg)}
 
 /* panels */
-.panel{background:linear-gradient(180deg,%(PANEL)s,rgba(16,23,37,.72));
-  border:1px solid %(LINE)s;border-radius:14px;padding:1.05rem 1.15rem;margin-bottom:1.2rem;
-  box-shadow:0 1px 0 rgba(255,255,255,.03) inset,0 24px 50px -34px rgba(0,0,0,.9)}
+.panel{background:linear-gradient(180deg,var(--panel),var(--panel-grad));
+  border:1px solid var(--line);border-radius:14px;padding:1.05rem 1.15rem;margin-bottom:1.2rem;
+  box-shadow:0 1px 0 rgba(255,255,255,.03) inset,var(--panel-shadow)}
 .phead{display:flex;align-items:baseline;gap:.6rem;margin-bottom:.75rem}
 .phead h2{position:relative;padding-left:.7rem}
 .phead h2::before{content:"";position:absolute;left:0;top:.05em;height:.85em;width:3px;border-radius:2px;
-  background:linear-gradient(%(ACCENT)s,%(ACCENT2)s);box-shadow:0 0 10px rgba(47,242,223,.7)}
-.phead .note{font-size:.72rem;color:%(FAINT)s;margin-left:auto}
+  background:linear-gradient(var(--accent),var(--accent2));box-shadow:0 0 10px rgba(47,242,223,.7)}
+.phead .note{font-size:.72rem;color:var(--faint);margin-left:auto}
 .chart{padding-bottom:.4rem}
-.equity{width:100%%;height:260px;display:block}
-.axis{fill:%(FAINT)s;font-size:10px;font-family:ui-monospace,monospace}
-.chart-empty,.empty{color:%(FAINT)s;font-size:.82rem;padding:1.5rem 0;text-align:center}
+.equity{width:100%;height:260px;display:block}
+.axis{fill:var(--faint);font-size:10px;font-family:ui-monospace,monospace}
+.chart-empty,.empty{color:var(--faint);font-size:.82rem;padding:1.5rem 0;text-align:center}
 .eqline{animation:draw 1.3s cubic-bezier(.2,.7,.2,1) forwards;filter:drop-shadow(0 0 6px rgba(51,232,160,.5))}
 .pulse{animation:pulse 2.4s ease-out infinite}
 @keyframes draw{to{stroke-dashoffset:0}}
-@keyframes pulse{0%%{opacity:.55}50%%{opacity:.14}100%%{opacity:.55}}
-@keyframes beat{0%%,100%%{transform:scale(1);opacity:1}50%%{transform:scale(1.35);opacity:.7}}
+@keyframes pulse{0%{opacity:.55}50%{opacity:.14}100%{opacity:.55}}
+@keyframes beat{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.35);opacity:.7}}
 
 /* layout split */
 .split{display:grid;grid-template-columns:1fr 300px;gap:1.2rem;align-items:start}
@@ -420,50 +442,50 @@ main{max-width:1180px;margin:0 auto;padding:1.25rem 1.25rem 0}
 
 /* tables */
 .tbl-wrap{overflow-x:auto;margin:0 -.3rem}
-.pos-tbl{width:100%%;border-collapse:collapse;font-size:.82rem}
-.pos-tbl th{font-size:.64rem;letter-spacing:.08em;text-transform:uppercase;color:%(MUTED)s;
-  font-weight:600;text-align:left;padding:.4rem .55rem;border-bottom:1px solid %(LINE)s}
-.pos-tbl td{padding:.5rem .55rem;border-bottom:1px solid rgba(36,50,68,.5)}
+.pos-tbl{width:100%;border-collapse:collapse;font-size:.82rem}
+.pos-tbl th{font-size:.64rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);
+  font-weight:600;text-align:left;padding:.4rem .55rem;border-bottom:1px solid var(--line)}
+.pos-tbl td{padding:.5rem .55rem;border-bottom:1px solid var(--line)}
 .pos-tbl tbody tr{transition:background .12s ease}
-.pos-tbl tbody tr:hover{background:rgba(47,242,223,.05)}
+.pos-tbl tbody tr:hover{background:var(--row-hover)}
 .pos-tbl .n{text-align:right}
 .pos-tbl .u{font-weight:700;letter-spacing:.01em}
 .pos-tbl .mono.pos,.pos-tbl .mono.neg{font-weight:600}
-.chip{font-size:.68rem;color:%(MUTED)s;background:%(PANEL2)s;border:1px solid %(LINE)s;
+.chip{font-size:.68rem;color:var(--muted);background:var(--panel2);border:1px solid var(--line);
   padding:.12rem .45rem;border-radius:6px;white-space:nowrap}
-.dte{color:%(MUTED)s}
-.arw{color:%(ACCENT)s;padding:0 .3rem;opacity:.7}
+.dte{color:var(--muted)}
+.arw{color:var(--accent);padding:0 .3rem;opacity:.7}
 .pbar{width:74px;padding:0 .3rem!important}
-.pb{position:relative;display:block;height:6px;width:70px;background:%(PANEL2)s;border-radius:3px}
-.pb-pos{position:absolute;height:6px;background:linear-gradient(90deg,%(POS)s,rgba(51,232,160,.55));
-  border-radius:3px;box-shadow:0 0 8px rgba(51,232,160,.6)}
-.pb-neg{position:absolute;height:6px;background:linear-gradient(270deg,%(NEG)s,rgba(255,93,115,.55));
-  border-radius:3px;box-shadow:0 0 8px rgba(255,93,115,.55)}
+.pb{position:relative;display:block;height:6px;width:70px;background:var(--panel2);border-radius:3px}
+.pb-pos{position:absolute;height:6px;background:linear-gradient(90deg,var(--pos),color-mix(in srgb,var(--pos) 55%,transparent));
+  border-radius:3px;box-shadow:0 0 8px color-mix(in srgb,var(--pos) 60%,transparent)}
+.pb-neg{position:absolute;height:6px;background:linear-gradient(270deg,var(--neg),color-mix(in srgb,var(--neg) 55%,transparent));
+  border-radius:3px;box-shadow:0 0 8px color-mix(in srgb,var(--neg) 55%,transparent)}
 .badge{font-size:.64rem;padding:.14rem .5rem;border-radius:6px;letter-spacing:.04em;font-weight:600;text-transform:uppercase}
-.badge.closed{color:%(POS)s;background:%(POS_DIM)s;box-shadow:0 0 0 1px rgba(51,232,160,.25) inset}
-.badge.cancel{color:%(MUTED)s;background:%(PANEL2)s}
-.badge.closing{color:%(ACCENT)s;background:rgba(47,242,223,.12);box-shadow:0 0 0 1px rgba(47,242,223,.3) inset}
-.rsn{color:%(MUTED)s;font-size:.76rem}
+.badge.closed{color:var(--pos);background:var(--pos-dim);box-shadow:0 0 0 1px color-mix(in srgb,var(--pos) 30%,transparent) inset}
+.badge.cancel{color:var(--muted);background:var(--panel2)}
+.badge.closing{color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 32%,transparent) inset}
+.rsn{color:var(--muted);font-size:.76rem}
 
 /* allocation bars */
 .alloc{display:flex;flex-direction:column;gap:.6rem}
 .abar{display:grid;grid-template-columns:1fr 90px auto;align-items:center;gap:.6rem;font-size:.76rem}
-.abar-l{color:%(MUTED)s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.abar-t{height:7px;background:%(PANEL2)s;border-radius:4px;overflow:hidden}
+.abar-l{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.abar-t{height:7px;background:var(--panel2);border-radius:4px;overflow:hidden}
 .abar-f{display:block;height:7px;border-radius:4px;
-  background:linear-gradient(90deg,%(ACCENT)s,%(ACCENT2)s);box-shadow:0 0 10px rgba(47,242,223,.5)}
-.abar-v{font-family:ui-monospace,monospace;color:%(INK)s;text-align:right}
+  background:linear-gradient(90deg,var(--accent),var(--accent2));box-shadow:0 0 10px rgba(47,242,223,.5)}
+.abar-v{font-family:ui-monospace,monospace;color:var(--ink);text-align:right}
 
 /* gauge / vrp */
 .gauge{width:168px;height:96px;display:block;margin:0 auto}
 .g-arc{filter:drop-shadow(0 0 6px var(--gc))}
-.g-big{fill:%(INK)s;font-size:24px;font-weight:700;font-family:ui-monospace,monospace}
-.g-sub{fill:%(FAINT)s;font-size:9px}
-.vrpv{font-size:.85rem;color:%(INK)s;font-weight:600}
-.vrp .note{color:%(FAINT)s;font-size:.7rem;margin-top:.3rem}
+.g-big{fill:var(--ink);font-size:24px;font-weight:700;font-family:ui-monospace,monospace}
+.g-sub{fill:var(--faint);font-size:9px}
+.vrpv{font-size:.85rem;color:var(--ink);font-weight:600}
+.vrp .note{color:var(--faint);font-size:.7rem;margin-top:.3rem}
 
-.foot{color:%(FAINT)s;font-size:.72rem;text-align:center;padding:1.5rem 0 0}
-.foot code{color:%(ACCENT)s}
+.foot{color:var(--faint);font-size:.72rem;text-align:center;padding:1.5rem 0 0}
+.foot code{color:var(--accent)}
 
 @media (max-width:820px){
   .kpis{grid-template-columns:repeat(2,1fr)}
@@ -473,9 +495,7 @@ main{max-width:1180px;margin:0 auto;padding:1.25rem 1.25rem 0}
 @media (prefers-reduced-motion:reduce){
   .eqline{animation:none;stroke-dashoffset:0}.pulse,.brand .dot{animation:none}
 }
-""" % {"BG": BG, "PANEL": PANEL, "PANEL2": PANEL2, "LINE": LINE, "INK": INK,
-       "MUTED": MUTED, "FAINT": FAINT, "POS": POS, "NEG": NEG, "ACCENT": ACCENT,
-       "ACCENT2": ACCENT2, "POS_DIM": POS_DIM, "NEG_DIM": NEG_DIM}
+"""
 
 
 if __name__ == "__main__":
