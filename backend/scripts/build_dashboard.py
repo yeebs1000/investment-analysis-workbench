@@ -69,14 +69,17 @@ def area_chart(dates: list[str], ys: list[float], ref: float | None,
     ex, ey = px(len(ys)-1), py(ys[-1])
     length = 2000
     return f"""<svg viewBox="0 0 {w} {h}" class="equity" preserveAspectRatio="none" role="img" aria-label="equity curve">
-<defs><linearGradient id="eg" x1="0" y1="0" x2="0" y2="1">
-<stop offset="0" stop-color="{col}" stop-opacity="0.40"/>
-<stop offset="0.55" stop-color="{ACCENT}" stop-opacity="0.10"/>
-<stop offset="1" stop-color="{ACCENT}" stop-opacity="0"/></linearGradient>
+<defs><linearGradient id="eg" x1="0" y1="0" x2="1" y2="0">
+<stop offset="0" stop-color="{ACCENT}"/><stop offset="1" stop-color="{ACCENT2}"/></linearGradient>
+<linearGradient id="efade" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#fff" stop-opacity="0.55"/>
+<stop offset="0.6" stop-color="#fff" stop-opacity="0.14"/>
+<stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+<mask id="em"><rect x="0" y="0" width="{w}" height="{h}" fill="url(#efade)"/></mask>
 <filter id="glow" x="-20%" y="-40%" width="140%" height="180%">
 <feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
 {grid}{refline}
-<polygon points="{area}" fill="url(#eg)"/>
+<polygon points="{area}" fill="url(#eg)" mask="url(#em)"/>
 <polyline points="{pts}" fill="none" stroke="{col}" stroke-width="4.5" stroke-linejoin="round"
  stroke-linecap="round" opacity="0.35" filter="url(#glow)"/>
 <polyline points="{pts}" fill="none" stroke="{col}" stroke-width="2.25" stroke-linejoin="round"
@@ -130,10 +133,18 @@ def build() -> Path:
     base = json.loads((PAPER / "baseline.json").read_text()) if (PAPER / "baseline.json").exists() else {}
     start_eq = base.get("account_equity_at_start")
     budget = base.get("working_budget_usd")
+    # book the sheet on a clean base: display equity = raw account equity minus a
+    # constant offset (raw_start - book_base), so the curve keeps its shape/P&L
+    # but reads from book_base. snapshot_equity keeps recording raw; we shift here.
+    offset = float(base.get("equity_offset", 0) or 0)
     marks = json.loads((PAPER / "marks.json").read_text()) if (PAPER / "marks.json").exists() else {}
 
     eq_path = PAPER / "equity.csv"
     eq = pd.read_csv(eq_path) if eq_path.exists() else pd.DataFrame(columns=["date", "equity", "cash"])
+    if offset and len(eq):
+        eq = eq.copy()
+        eq["equity"] = eq["equity"].astype(float) - offset
+        eq["cash"] = eq["cash"].astype(float) - offset
     cur_eq = float(eq["equity"].iloc[-1]) if len(eq) else start_eq
     cash = float(eq["cash"].iloc[-1]) if len(eq) and "cash" in eq else None
     pnl = (cur_eq - start_eq) if (cur_eq is not None and start_eq) else None
