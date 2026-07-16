@@ -92,8 +92,14 @@ def load_watchlist() -> list[str]:
             if ln.strip() and not ln.startswith("#")]
 
 
-PACING_S = 2.0        # pause between symbols -- rapid-fire snapshots trip
-                      # Moomoo's packet timeout (seen live: PacketErr.Timeout)
+PACING_S = 3.5        # Moomoo hard-caps get_option_chain at 10 per 30s (a 3.0s
+                      # floor); 3.5 leaves ~8.6/30s of margin. Measured 2026-07-16:
+                      # at 2.0 the run hit 13.4 calls/30s, tripped the cap ~50
+                      # symbols in, and could not recover -- rejections return in
+                      # 0ms, so a failing loop paces FASTER than a working one.
+                      # ponytail: fixed pacing, not a token bucket. Revisit only if
+                      # the per-symbol call count changes.
+RATE_BACKOFF_S = 31.0  # on a "high frequency" rejection, wait out the 30s window
 RETRY_PASSES = 2      # transient timeouts usually clear on a later pass
 
 
@@ -148,6 +154,11 @@ def main() -> None:
                 ok += 1
             except Exception as e:  # noqa: BLE001 - one bad symbol never kills the run
                 print(f"  {code}: SKIP ({e})", flush=True)
+                # A rate rejection returns in ~0ms, so a tripped loop paces faster
+                # than a healthy one and never recovers. Wait out the window.
+                if "high frequency" in str(e).lower():
+                    print(f"  rate-limited -- backing off {RATE_BACKOFF_S:.0f}s", flush=True)
+                    time.sleep(RATE_BACKOFF_S)
             time.sleep(PACING_S)   # don't trip Moomoo's packet pacing
     missing = [c for c in codes if c not in {p.stem for p in out_dir.glob('*.parquet')}]
     print(f"done: {ok} recorded this run, {len(missing)} missing "
