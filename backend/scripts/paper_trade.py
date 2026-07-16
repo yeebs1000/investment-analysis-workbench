@@ -581,10 +581,12 @@ def main() -> None:
         encoding="utf-8")
 
     try:
-        from scripts.build_dashboard import build, snapshot_equity
+        from scripts.build_dashboard import build, snapshot_equity, write_marks
         if equity is not None:
             cash = float(acc.iloc[0]["cash"]) if "cash" in acc.columns else None
             snapshot_equity(equity, cash)
+        if broker is not None:
+            write_marks(broker)
         build()
     except Exception as e:  # noqa: BLE001
         print(f"dashboard refresh failed: {e}")
