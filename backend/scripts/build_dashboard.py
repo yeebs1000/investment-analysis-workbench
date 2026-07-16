@@ -233,7 +233,7 @@ def build() -> Path:
     head = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark light">
-<title>Paper Book · {money(cur_eq)}</title><style>{CSS}</style></head><body>"""
+<title>Paper Book · {money(cur_eq)}</title><style>{CSS}</style>{PRE_JS}</head><body>"""
 
     body = f"""
 <header class="bar">
@@ -244,6 +244,7 @@ def build() -> Path:
     <span class="mono {totalcls} delta">{('+' if (pnl or 0)>=0 else '')}{money(pnl)} · {pct}</span>
   </div>
   <div class="upd">{now}</div>
+  <button class="theme-btn" id="tbtn" type="button" aria-label="Toggle theme"></button>
 </header>
 
 <main>
@@ -290,6 +291,7 @@ def build() -> Path:
 
   <footer class="foot">Private · SIMULATE account only · ledgers in <code>data_store/paper/</code> · never committed</footer>
 </main>
+{TOGGLE_JS}
 </body></html>"""
 
     JOURNAL.mkdir(parents=True, exist_ok=True)
@@ -344,8 +346,7 @@ def snapshot_equity(equity: float, cash: float) -> None:
     df.to_csv(eq_path, index=False)
 
 
-CSS = f""":root{{
-  color-scheme:light dark;
+_DARK = f"""
   --bg:{BG};--panel:{PANEL};--panel2:{PANEL2};--panel-grad:rgba(16,23,37,.72);
   --line:{LINE};--ink:{INK};--muted:{MUTED};--faint:{FAINT};
   --pos:{POS};--neg:{NEG};--accent:{ACCENT};--accent2:{ACCENT2};
@@ -354,19 +355,27 @@ CSS = f""":root{{
   --panel-shadow:0 24px 50px -34px rgba(0,0,0,.9);
   --glow-eq:0 0 18px rgba(244,247,255,.25);--glow-v:0 0 16px rgba(244,247,255,.14);
   --glow-pos:0 0 18px rgba(51,232,160,.55);--glow-neg:0 0 18px rgba(255,93,115,.5);
-  --row-hover:rgba(47,242,223,.05);
-}}
-@media (prefers-color-scheme:light){{:root{{
+  --row-hover:rgba(47,242,223,.05);"""
+
+# light mode keeps a soft, tinted glow on the key numbers (not off)
+_LIGHT = """
   --bg:#eef2f7;--panel:#ffffff;--panel2:#eff3fa;--panel-grad:#f6f9fe;
   --line:#dce3ef;--ink:#0f1826;--muted:#55617a;--faint:#94a0b4;
   --pos:#0c7a4f;--neg:#cf2740;--accent:#0a8f83;--accent2:#6a44d6;
   --pos-dim:#d7f3e6;--neg-dim:#fbe0e4;
   --grid:rgba(120,140,170,.26);--bar-bg:rgba(255,255,255,.78);
   --panel-shadow:0 18px 40px -30px rgba(30,50,90,.28);
-  --glow-eq:none;--glow-v:none;--glow-pos:none;--glow-neg:none;
-  --row-hover:rgba(10,143,131,.08);
-}}}}
-""" + """
+  --glow-eq:0 0 14px rgba(10,143,131,.26);--glow-v:0 0 11px rgba(10,143,131,.16);
+  --glow-pos:0 0 13px rgba(12,122,79,.34);--glow-neg:0 0 13px rgba(207,39,64,.30);
+  --row-hover:rgba(10,143,131,.08);"""
+
+# theme resolution: base :root = dark. Explicit data-theme (from the toggle)
+# wins; otherwise OS preference picks light. data-theme is persisted client-side.
+CSS = (f':root{{color-scheme:light dark;{_DARK}\n}}\n'
+       f':root[data-theme="dark"]{{color-scheme:dark}}\n'
+       f':root[data-theme="light"]{{color-scheme:light;{_LIGHT}\n}}\n'
+       f'@media (prefers-color-scheme:light){{:root:not([data-theme="dark"]){{{_LIGHT}\n}}}}\n'
+       + """
 *{box-sizing:border-box;margin:0}
 body{background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
   font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased;padding-bottom:3rem;position:relative}
@@ -400,6 +409,11 @@ main{max-width:1180px;margin:0 auto;padding:1.25rem 1.25rem 0}
 .bar-eq .eq{font-size:1.3rem;font-weight:700;letter-spacing:-.01em;text-shadow:var(--glow-eq)}
 .bar-eq .delta{font-size:.85rem;font-weight:600}
 .upd{color:var(--faint);font-size:.72rem;min-width:9ch;text-align:right;letter-spacing:.02em}
+.theme-btn{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;flex:none;
+  border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--muted);cursor:pointer;
+  transition:color .15s ease,border-color .15s ease,background .15s ease}
+.theme-btn:hover{color:var(--ink);border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.theme-btn svg{display:block}
 
 /* kpi strip */
 .kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;
@@ -495,7 +509,26 @@ main{max-width:1180px;margin:0 auto;padding:1.25rem 1.25rem 0}
 @media (prefers-reduced-motion:reduce){
   .eqline{animation:none;stroke-dashoffset:0}.pulse,.brand .dot{animation:none}
 }
-"""
+""")
+
+# applied in <head> so a saved theme is set before first paint (no flash)
+PRE_JS = ("<script>try{var s=localStorage.getItem('pbtheme');"
+          "if(s)document.documentElement.setAttribute('data-theme',s);}catch(e){}</script>")
+
+# wires the header toggle: swaps data-theme, persists it, repaints the icon
+TOGGLE_JS = """<script>
+(function(){
+  var root=document.documentElement,btn=document.getElementById('tbtn');
+  if(!btn)return;
+  var SUN='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5 5l1.4 1.4M17.6 17.6 19 19M19 5l-1.4 1.4M6.4 17.6 5 19"/></svg>';
+  var MOON='<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M20 14.6A8 8 0 0 1 9.4 4 7 7 0 1 0 20 14.6z"/></svg>';
+  function eff(){var t=root.getAttribute('data-theme');if(t)return t;return window.matchMedia('(prefers-color-scheme:light)').matches?'light':'dark';}
+  function paint(){var d=eff()==='dark';btn.innerHTML=d?SUN:MOON;btn.setAttribute('aria-label',d?'Switch to light mode':'Switch to dark mode');}
+  paint();
+  btn.addEventListener('click',function(){var n=eff()==='dark'?'light':'dark';root.setAttribute('data-theme',n);try{localStorage.setItem('pbtheme',n);}catch(e){}paint();});
+  try{window.matchMedia('(prefers-color-scheme:light)').addEventListener('change',paint);}catch(e){}
+})();
+</script>"""
 
 
 if __name__ == "__main__":
