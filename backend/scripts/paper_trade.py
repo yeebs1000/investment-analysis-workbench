@@ -29,8 +29,10 @@ sys.path.insert(0, str(BACKEND))
 import pandas as pd
 
 # --- criteria / caps ---------------------------------------------------------
-MAX_LEG_SPREAD_PCT = 10.0     # per leg, bid/ask over mid
-MIN_LEG_OI = 25       # lockstep with log_signals prefilter
+# The per-leg execution gate lives in log_signals (leg_tradeable) so the entry
+# check and the signal prefilter cannot drift apart -- they were duplicated
+# constants with a "keep them in lockstep" comment, which is how drift starts.
+from scripts.log_signals import MIN_OI as MIN_LEG_OI, leg_tradeable  # noqa: E402
 MAX_NEW_PER_DAY = 8
 MAX_OPEN_STRUCTURES = 30
 
@@ -118,16 +120,7 @@ def structure_groups(sig: pd.DataFrame):
     """Yield (underlying, strategy, legs-DataFrame) for structures whose every
     leg passes the liquidity criteria."""
     for (code, strat), g in sig.groupby(["code", "strategy"]):
-        ok = True
-        for _, leg in g.iterrows():
-            m = _mid(leg)
-            if m is None or m <= 0:
-                ok = False; break
-            if (leg["ask"] - leg["bid"]) / m * 100.0 > MAX_LEG_SPREAD_PCT:
-                ok = False; break
-            if pd.isna(leg["oi"]) or leg["oi"] < MIN_LEG_OI:
-                ok = False; break
-        if ok:
+        if all(leg_tradeable(l["bid"], l["ask"], l["oi"]) for _, l in g.iterrows()):
             yield code, strat, g
 
 

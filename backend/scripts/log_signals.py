@@ -28,24 +28,54 @@ SIGNALS_DIR = BACKEND / "data_store" / "signals"
 # the FULL chain, then 53/87 structures failed the execution gates (leg spread
 # <= 10% of mid, OI >= 50). Filtering the chain BEFORE strike selection makes
 # every proposed structure executable by construction -- the strategist lands
-# on the nearest tradeable strike instead of a fantasy one. Thresholds match
-# scripts/paper_trade.py exactly; keep them in lockstep.
-MAX_LEG_SPREAD_PCT = 10.0
-MIN_OI = 25            # was 50; relaxed as a measured experiment (spread gate unchanged)
+# on the nearest tradeable strike instead of a fantasy one.
+#
+# 2026-07-17: a pure %-of-mid gate measures PREMIUM, not liquidity. Over 4,538
+# two-sided legs it passed 76% of ATM legs but only 27% of 0.15-delta wings --
+# median wing spread $0.41 on a $2.02 mid (20%) vs ATM $0.67 on a $12.65 mid
+# (5%). The absolute cost of crossing is comparable (~$20-35/contract); the
+# ratio just flatters expensive legs. Credit spreads need a cheap wing, so they
+# were being starved: 1 Bull Put Spread survived out of 67 structures. A leg is
+# therefore ALSO tradeable when its absolute spread is tight -- still capped by
+# WIDE_SPREAD_PCT_CAP so far-OTM junk (median 60% spread) stays out.
+# Measured effect: wing pass 26.8% -> 49.8%, far-OTM 10% -> 27%, overall 58% -> 66%.
+# ponytail: per-leg gate. The economically exact test is structure-level slippage
+# vs the credit earned; revisit if legs-per-structure grows past 2.
+MAX_LEG_SPREAD_PCT = 10.0    # normal gate: spread as % of mid
+WIDE_ABS_SPREAD = 0.50       # ...or a tight ABSOLUTE spread (~$25/contract to cross)
+WIDE_SPREAD_PCT_CAP = 30.0   # ...but never a leg where crossing eats a third of it
+MIN_OI = 25            # was 50; relaxed as a measured experiment
 MIN_TRADEABLE_PER_SIDE = 3   # need a few strikes per right or skip the symbol
+
+
+def leg_tradeable(bid, ask, oi) -> bool:
+    """One leg's execution gate. Single source of truth: the signal prefilter
+    and paper_trade's entry check both call this, so they cannot drift."""
+    try:
+        bid = float(bid); ask = float(ask); oi = float(oi)
+    except (TypeError, ValueError):
+        return False
+    if bid != bid or ask != ask or oi != oi:      # NaN-safe
+        return False
+    if bid <= 0 or ask < bid or oi < MIN_OI:
+        return False
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return False
+    spr = ask - bid
+    pct = spr / mid * 100.0
+    return pct <= MAX_LEG_SPREAD_PCT or (spr <= WIDE_ABS_SPREAD and pct <= WIDE_SPREAD_PCT_CAP)
 
 
 def tradeable_chain(ch):
     """Subset of the recorded chain that passes the execution gates."""
     import pandas as pd
     df = ch.dropna(subset=["bid", "ask"]).copy()
-    df = df[(df["bid"] > 0) & (df["ask"] >= df["bid"])]
     if df.empty:
         return df
-    mid = (df["bid"] + df["ask"]) / 2.0
-    df = df[(df["ask"] - df["bid"]) / mid * 100.0 <= MAX_LEG_SPREAD_PCT]
-    df = df[pd.to_numeric(df["oi"], errors="coerce").fillna(0) >= MIN_OI]
-    return df
+    oi = pd.to_numeric(df["oi"], errors="coerce").fillna(0)
+    keep = [leg_tradeable(b, a, o) for b, a, o in zip(df["bid"], df["ask"], oi)]
+    return df[pd.Series(keep, index=df.index)]
 
 
 def main() -> None:
