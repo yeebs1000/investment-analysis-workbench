@@ -52,10 +52,21 @@ except ImportError:  # pragma: no cover
         TrdSide,
     )
 
+import time
+
 from app.config import settings
 
 PAPER_ENV = TrdEnv.SIMULATE          # the one and only environment. Never change.
 LEDGER_DIR = Path(__file__).resolve().parents[2] / "data_store" / "paper"
+
+# Moomoo hard-caps place_order at 15 per 30s. Exceeding it returns REJECTED
+# ("high frequency"), and because the entry loop counts SUCCESSES, a rejected
+# batch just makes it retry the whole candidate list -- 92 rejects / 56 aborts
+# on 2026-07-17. Throttle here at the broker boundary so EVERY order path is
+# covered and cannot drift. Margin under the cap absorbs any other client
+# (e.g. a second app) drawing on the same per-account budget.
+ORDER_RATE_MAX = 13
+ORDER_RATE_WINDOW = 30.0
 
 
 class PaperBrokerError(RuntimeError):
@@ -75,7 +86,20 @@ class PaperBroker:
         self.port = port or settings.opend_port
         self._trade: OpenSecTradeContext | None = None
         self.acc_id: int | None = None
+        self._order_times: list[float] = []   # sliding window for rate throttle
         LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _throttle_order(self) -> None:
+        """Block until placing one more order stays under the 15/30s cap."""
+        now = time.time()
+        self._order_times = [t for t in self._order_times if now - t < ORDER_RATE_WINDOW]
+        if len(self._order_times) >= ORDER_RATE_MAX:
+            wait = ORDER_RATE_WINDOW - (now - self._order_times[0]) + 0.1
+            if wait > 0:
+                time.sleep(wait)
+            now = time.time()
+            self._order_times = [t for t in self._order_times if now - t < ORDER_RATE_WINDOW]
+        self._order_times.append(time.time())
 
     # --- lifecycle -----------------------------------------------------
     def connect(self) -> "PaperBroker":
@@ -136,6 +160,7 @@ class PaperBroker:
             "note": note, "status": "INTENT",
         }
         self._ledger(intent)
+        self._throttle_order()          # never exceed Moomoo's 15/30s place-order cap
         ret, data = self._trade.place_order(
             price=round(price, 2), qty=qty, code=code, trd_side=trd_side,
             order_type=OrderType.NORMAL, trd_env=PAPER_ENV, acc_id=self.acc_id)
