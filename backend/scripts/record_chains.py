@@ -126,7 +126,11 @@ def _record_one(service, code: str, out_dir: Path, today: str) -> None:
     contracts["expiry"] = expiry
     contracts["dte"] = dte
     contracts["source"] = source
-    contracts.to_parquet(out_dir / f"{code}.parquet", index=False)
+    # atomic: a kill mid-write must not leave a corrupt .parquet that the
+    # resume-set glob counts as "done" (silently losing the symbol's day)
+    tmp = out_dir / f"{code}.tmp"
+    contracts.to_parquet(tmp, index=False)
+    os.replace(tmp, out_dir / f"{code}.parquet")
     two_sided = int(((contracts["bid"] > 0) & (contracts["ask"] > 0)).sum())
     print(f"  {code}: {len(contracts)} contracts ({two_sided} two-sided) "
           f"exp {expiry} via {source}", flush=True)
@@ -164,15 +168,19 @@ def main() -> None:
     missing = [c for c in codes if c not in {p.stem for p in out_dir.glob('*.parquet')}]
     print(f"done: {ok} recorded this run, {len(missing)} missing "
           f"({', '.join(missing) if missing else 'none'}) -> {out_dir}", flush=True)
+    # honest exit code: >50% of the watchlist missing is a FAILED night, not a
+    # green one (a 0-symbol night used to report success into the void)
+    return 1 if len(missing) > len(codes) // 2 else 0
 
 
 if __name__ == "__main__":
     from scripts._lock import single_instance
+    rc = 0
     with single_instance("record_chains") as got:
         if got:
-            main()
+            rc = main() or 0
         else:
             print("another record_chains instance holds the lock -- exiting (work is being done)")
     # Moomoo SDK leaves non-daemon threads; exit hard AFTER the lock released.
     sys.stdout.flush()
-    os._exit(0)
+    os._exit(rc)

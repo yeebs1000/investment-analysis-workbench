@@ -86,17 +86,22 @@ def main() -> None:
     from app.ml.data_store import BarStore
 
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    day = args[0] if args else max(p.name for p in CHAINS_DIR.iterdir() if p.is_dir())
+    # session date comes from the ET clock, NOT max() over chain dirs: the max()
+    # fallback silently processed YESTERDAY's chains when tonight's recording
+    # failed -- three green stages, zero real output. An explicit arg still wins.
+    from scripts._session import session_date
+    day = args[0] if args else session_date()
     out_override = None
     if "--out" in sys.argv:
         out_override = Path(sys.argv[sys.argv.index("--out") + 1])
     chain_dir = CHAINS_DIR / day
     if not chain_dir.is_dir():
-        print(f"no chain dir for {day}"); return
+        print(f"no chain dir for {day} -- refusing to fall back to an older night")
+        return 1
     SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = out_override or (SIGNALS_DIR / f"{day}.csv")
     if out_path.exists():
-        print(f"{out_path.name} already exists -- idempotent skip"); return
+        print(f"{out_path.name} already exists -- idempotent skip"); return 0
 
     store = BarStore()
     bench = store.load("US.SPY")
@@ -137,7 +142,13 @@ def main() -> None:
             for s in res.strategies:
                 for leg in s.legs:
                     q = snap.loc[leg.code] if leg.code in snap.index else None
-                    theo = options_math.bsm_price(spot, leg.strike, leg.iv_pct, dte, leg.right)
+                    # rate matters: at r=0 the logged theo manufactured a fake
+                    # -4.9% call / +3.6% put "mispricing" that was entirely the
+                    # omitted risk-free rate (diagnostic column only; EV/POP
+                    # never consume theo_bsm)
+                    theo = options_math.bsm_price(
+                        spot, leg.strike, leg.iv_pct, dte, leg.right,
+                        rate=options_math.RISK_FREE_RATE_PCT / 100.0)
                     sym_rows.append({
                         "date": day, "code": code, "spot": spot, "expiry": expiry, "dte": dte,
                         "decision": ta.decision.value, "confidence": ta.confidence,
@@ -157,16 +168,29 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001 - one bad symbol never kills the log
             print(f"  {f.stem}: SKIP ({e})", flush=True)
 
-    pd.DataFrame(rows).to_csv(out_path, index=False)
+    # atomic write: a kill mid-write must not leave a partial CSV that the
+    # exists-skip above would then lock in forever
+    df = pd.DataFrame(rows)
+    tmp = out_path.with_suffix(".csv.tmp")
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, out_path)
+    # per-run archive so a later, smaller re-scan can never erase the file the
+    # entry engine actually traded from (28% of live entries were unjoinable)
+    arch = SIGNALS_DIR / "archive"
+    arch.mkdir(exist_ok=True)
+    df.to_csv(arch / f"{day}-{dt.datetime.now():%H%M%S}.csv", index=False)
     print(f"logged {len(rows)} leg rows -> {out_path}", flush=True)
-    sys.stdout.flush()
-    os._exit(0)
+    # honest exit: zero rows from a full chain dir is a broken night, not a green one
+    return 1 if (len(rows) == 0 and len(files) > 0) else 0
 
 
 if __name__ == "__main__":
     from scripts._lock import single_instance
+    rc = 0
     with single_instance("log_signals") as got:
         if got:
-            main()
+            rc = main() or 0
         else:
             print("another log_signals instance holds the lock -- exiting")
+    sys.stdout.flush()
+    os._exit(rc)

@@ -36,6 +36,22 @@ from scripts.log_signals import MIN_OI as MIN_LEG_OI, leg_tradeable  # noqa: E40
 from scripts._session import session_date  # noqa: E402
 MAX_NEW_PER_DAY = 8
 MAX_OPEN_STRUCTURES = 30
+# Diversity cap (weekly review 2026-07-18): regime gate + drift prior + EV/risk
+# ranking made the book 22/25 long-delta -- one selloff hit everything at once.
+# Capping same-strategy entries per night admits the best OTHER structures
+# without touching any validated per-structure formula. Forward-validate.
+MAX_PER_STRATEGY_PER_DAY = 3
+# EV floor: EV/max_loss ranking preferentially tops exactly the small-denominator
+# structures where round-trip friction (~$2.60 on a 2-leg spread) eats 7-50% of
+# the modeled edge. No commission term exists in EV; this floor stands in for it.
+MIN_EV_PER_SHARE = 0.05
+
+# Kill switch: data_store/HALT (manual, just create the file) or a daily loss
+# beyond DAILY_LOSS_HALT_PCT flips the run to degraded mode -- exits/hygiene
+# still run, NEW entries are skipped. Fail-open direction is "skip entries",
+# never "skip exits".
+HALT_FILE = BACKEND / "data_store" / "HALT"
+DAILY_LOSS_HALT_PCT = 2.0
 
 # --- budget sizing (pass --budget N; without it every structure is 1 lot) ----
 RISK_FRAC = 0.01              # max loss per structure as fraction of budget
@@ -156,11 +172,15 @@ def _close_legs(broker, s: dict, legs: list[dict], reason: str, bqty: dict,
     actually hold -- certainty of fill over price finesse, and every fill is a
     real cost datapoint. Falls back to the ledger mid if no live quote."""
     for leg in legs:
-        held = abs(bqty.get(leg["code"], 0.0))
+        signed = bqty.get(leg["code"], 0.0)
+        held = abs(signed)
         qty = min(leg["qty"], held)
         if qty < 1:
             continue
-        side = "SELL" if leg["side"] == "BUY" else "BUY"
+        # flatten side from the BROKER's position sign, not the ledger's memory:
+        # if any state drift ever leaves the position flipped, closing "the
+        # ledger's side" would grow the error instead of erasing it
+        side = "SELL" if signed > 0 else "BUY"
         px = None
         if snap is not None and leg["code"] in snap.index:
             row = snap.loc[leg["code"]]
@@ -193,12 +213,41 @@ def sync_lifecycle(broker, structs: list[dict], today: str) -> list[str]:
     Without this, CLOSING was a dead-end and phantom OPEN structures would
     eventually fire DTE exits for positions that never existed."""
     lines = []
-    try:
-        bqty, _ = _broker_qty(broker)
-    except Exception as e:  # noqa: BLE001
-        return [f"- lifecycle sync skipped: {e}"]
+    # Broker-state failure is RUN-FATAL, not a skip: proceeding without
+    # positions would leave CLOSING structures without working exit orders
+    # while the night still reads "successful".
+    bqty, _ = _broker_qty(broker)
     retry_codes = [l["code"] for s in structs if s["status"] == "CLOSING" for l in s["legs"]]
     snap = _live_snapshot(retry_codes) if retry_codes else None
+    # open orders once, for CLOSING-exit refresh and PENDING adoption below.
+    # RUN-FATAL on failure (like positions): with an empty order map the
+    # CLOSING cancel-half would silently no-op while the re-place half still
+    # fires -- duplicate exits that can flip a position and grow it nightly.
+    try:
+        from moomoo import OrderStatus
+        open_orders = broker.orders(status_filter_list=[
+            OrderStatus.SUBMITTED, OrderStatus.WAITING_SUBMIT, OrderStatus.SUBMITTING])
+    except ImportError:
+        open_orders = None          # test environment without the SDK
+    open_by_code: dict[str, list[str]] = {}
+    if open_orders is not None and not open_orders.empty:
+        for _, o in open_orders.iterrows():
+            open_by_code.setdefault(str(o["code"]), []).append(str(o["order_id"]))
+
+    for s in structs:
+        if s["status"] == "PENDING_ENTRY":
+            # write-ahead record from a run killed mid-placement: adopt if the
+            # broker shows any evidence of it, else mark aborted
+            claimed = {l["code"] for x in structs if x is not s
+                       and x["status"] in ("OPEN", "CLOSING") for l in x["legs"]}
+            evidence = any((abs(bqty.get(l["code"], 0.0)) > 0 or l["code"] in open_by_code)
+                           and l["code"] not in claimed for l in s["legs"])
+            s["status"] = "OPEN" if evidence else "ABORTED_ENTRY"
+            if not evidence:
+                s["capital"] = 0.0
+                s["exit_reason"] = "run killed before any leg was placed"
+            lines.append(f"- {s['underlying']} {s['strategy']}: PENDING_ENTRY -> {s['status']}"
+                         f" (killed mid-entry {s['entry_date']})")
     for s in structs:
         if s["status"] == "OPEN" and s["entry_date"] < today:
             held = [l for l in s["legs"] if abs(bqty.get(l["code"], 0.0)) > 0]
@@ -221,8 +270,15 @@ def sync_lifecycle(broker, structs: list[dict], today: str) -> list[str]:
                 s["closed_date"] = today
                 lines.append(f"- {s['underlying']} {s['strategy']}: exits filled -> CLOSED")
             else:
+                # this structure OWNS its exit refresh: cancel its stale exit
+                # orders, then re-place -- back-to-back, so there is no window
+                # where the legs sit with no working exit (hygiene no longer
+                # touches CLOSING codes at all)
+                for l in held:
+                    for oid in open_by_code.get(l["code"], []):
+                        broker.cancel_order(oid)
                 _close_legs(broker, s, held, f"retry: {s.get('exit_reason', 'exit')}", bqty, snap)
-                lines.append(f"- {s['underlying']} {s['strategy']}: retrying exit on {len(held)} leg(s) at crossing prices")
+                lines.append(f"- {s['underlying']} {s['strategy']}: refreshed exit on {len(held)} leg(s) at crossing prices")
     return lines
 
 
@@ -415,61 +471,61 @@ def do_entries(broker, structs, journal, sig_path, budget, today, max_new=None) 
     except Exception:  # noqa: BLE001 - empty/corrupt CSV must not kill the run
         journal.append("- signals file empty or unreadable -- no entries today")
         return 0
+    # freshness gate: refuse to trade a stale signal file (a leftover copy of
+    # yesterday's file once nearly traded on yesterday's mids/IVs/spots)
+    if "date" in sig.columns and str(sig["date"].iloc[0]) != today:
+        journal.append(f"- signals file is dated {sig['date'].iloc[0]}, session is {today}"
+                       f" -- STALE, refusing to enter")
+        return 0
     capital_in_use = sum(s.get("capital", 0.0) for s in structs
                          if s["status"] in ("OPEN", "CLOSING"))
     # rank candidates by model EV per unit risk, best first (was alphabetical)
     groups = sorted(structure_groups(sig),
                     key=lambda t: -((t[2]["ev_per_share"].iloc[0] or 0)
                                     / max(t[2]["max_loss"].iloc[0] or 1e9, 0.01)))
-    entered = 0
-    for code, strat, legs in groups:
-        if placed >= cap or n_open + entered >= MAX_OPEN_STRUCTURES:
-            journal.append("- caps reached; remaining signals skipped")
-            break
-        if code in open_unders:
-            continue                    # one structure per underlying
-        if EXPECTED_LEGS.get(strat) is not None and len(legs) != EXPECTED_LEGS[strat]:
-            journal.append(f"- skip {code} {strat}: {len(legs)} legs in signals, "
-                           f"expected {EXPECTED_LEGS[strat]} (partial row-set)")
-            continue
-        sid = f"{today}-{code}-{strat}".replace(" ", "_")
-        if sid in existing_ids:
-            continue                    # same-day re-entry after a close: skip
+    state = {"entered": 0, "placed": placed, "capital_in_use": capital_in_use}
+    by_strategy: dict[str, int] = {}
+    for s in structs:
+        if s.get("entry_date") == today and s.get("kind") != "HEDGE" \
+                and s["status"] in ("OPEN", "CLOSING", "PENDING_ENTRY"):
+            by_strategy[s["strategy"]] = by_strategy.get(s["strategy"], 0) + 1
+
+    def try_enter(code, strat, legs, sid) -> str:
+        """Attempt one structure. Returns 'entered' | 'aborted' | 'skipped'."""
         row0 = legs.iloc[0]
         net = float(row0["net_debit_credit"]) if pd.notna(row0["net_debit_credit"]) else None
         max_loss = float(row0["max_loss"]) if pd.notna(row0["max_loss"]) else None
         leg_meta = [{"strike": float(l["leg_strike"])} for _, l in legs.iterrows()]
         n_contracts, capital, why = size_structure(budget, strat, leg_meta, net,
-                                                   max_loss, capital_in_use)
+                                                   max_loss, state["capital_in_use"])
         if n_contracts < 1:
             journal.append(f"- skip {code} {strat}: {why}")
-            continue
-        leg_recs, rejected = [], False
-        for _, leg in legs.iterrows():
-            m = _mid(leg)
-            res = broker.place_limit(leg["leg_code"], n_contracts,
-                                     leg["leg_action"].upper(), m,
-                                     note=f"ENTRY {sid}")
-            if res.get("status") == "REJECTED":
-                rejected = True
-            leg_recs.append({
-                "code": leg["leg_code"], "side": leg["leg_action"].upper(), "qty": n_contracts,
-                "right": leg["leg_right"], "strike": float(leg["leg_strike"]),
-                "entry_mid": round(m, 2), "theo": round(float(leg["theo_bsm"]), 2) if pd.notna(leg["theo_bsm"]) else None,
-                "bid": float(leg["bid"]), "ask": float(leg["ask"]),
-                "order_status": res.get("status"), "order_id": res.get("order_id"),
-            })
+            return "skipped"
         # max profit: credit = the credit; VERTICALS (one buy + one sell) =
         # width - debit. All-long 2-leg structures (straddle) have none.
+        strikes = [float(l["leg_strike"]) for _, l in legs.iterrows()]
+        sides = {str(l["leg_action"]).upper() for _, l in legs.iterrows()}
         max_profit = None
         if net is not None and net > 0:
             max_profit = net
-        elif net is not None and len(leg_recs) == 2 \
-                and {l["side"] for l in leg_recs} == {"BUY", "SELL"}:
-            width = abs(leg_recs[0]["strike"] - leg_recs[1]["strike"])
+        elif net is not None and len(strikes) == 2 and sides == {"BUY", "SELL"}:
+            width = abs(strikes[0] - strikes[1])
             max_profit = width - abs(net) if width - abs(net) > 0 else None
+        # full leg skeletons FIRST (codes/sides/qty from the signal rows) so
+        # the write-ahead record is adoptable: lifecycle sync matches broker
+        # evidence BY LEG CODE, and an empty legs list can never match anything
+        leg_recs = []
+        for _, leg in legs.iterrows():
+            leg_recs.append({
+                "code": leg["leg_code"], "side": leg["leg_action"].upper(), "qty": n_contracts,
+                "right": leg["leg_right"], "strike": float(leg["leg_strike"]),
+                "entry_mid": round(_mid(leg), 2),
+                "theo": round(float(leg["theo_bsm"]), 2) if pd.notna(leg["theo_bsm"]) else None,
+                "bid": float(leg["bid"]), "ask": float(leg["ask"]),
+                "order_status": "PENDING", "order_id": None,
+            })
         rec = {
-            "id": sid, "underlying": code, "strategy": strat, "status": "OPEN",
+            "id": sid, "underlying": code, "strategy": strat, "status": "PENDING_ENTRY",
             "entry_date": today, "expiry": str(row0["expiry"]), "dte": int(row0["dte"]),
             "pop_pct": float(row0["pop_pct"]) if pd.notna(row0["pop_pct"]) else None,
             "ev_per_share": float(row0["ev_per_share"]) if pd.notna(row0["ev_per_share"]) else None,
@@ -477,6 +533,19 @@ def do_entries(broker, structs, journal, sig_path, budget, today, max_new=None) 
             "contracts": n_contracts, "capital": round(capital, 2),
             "legs": leg_recs,
         }
+        # WRITE-AHEAD: the record hits disk BEFORE any order leaves. If this
+        # process dies mid-placement, the next run's lifecycle sync adopts or
+        # aborts the PENDING row instead of discovering orphan fills months on.
+        structs.append(rec)
+        _save_structures(structs)
+        rejected = False
+        for lr in leg_recs:
+            res = broker.place_limit(lr["code"], n_contracts, lr["side"],
+                                     lr["entry_mid"], note=f"ENTRY {sid}")
+            if res.get("status") == "REJECTED":
+                rejected = True
+            lr["order_status"] = res.get("status")
+            lr["order_id"] = res.get("order_id")
         if rejected:
             # abort: cancel the sibling orders that did submit; hold no capital
             for lr in leg_recs:
@@ -484,20 +553,67 @@ def do_entries(broker, structs, journal, sig_path, budget, today, max_new=None) 
                     broker.cancel_order(lr["order_id"])
             rec["status"] = "ABORTED_ENTRY"
             rec["capital"] = 0.0
-            structs.append(rec)
+            _save_structures(structs)
             journal.append(f"- ABORT {code} {strat}: a leg was rejected; siblings cancelled")
-            continue
-        structs.append(rec)
-        existing_ids.add(sid)
-        capital_in_use += capital
+            return "aborted"
+        rec["status"] = "OPEN"
+        _save_structures(structs)
+        state["capital_in_use"] += capital
         open_unders.add(code)
-        placed += 1
-        entered += 1
+        by_strategy[strat] = by_strategy.get(strat, 0) + 1
+        state["placed"] += 1
+        state["entered"] += 1
         journal.append(f"- ENTER {code} {strat}: {n_contracts}x {len(leg_recs)} leg(s) at mid, "
                        f"capital ~${capital:,.0f} (POP {row0['pop_pct']}%, EV {row0['ev_per_share']})")
-    if entered == 0:
+        return "entered"
+
+    aborted_tonight: list[tuple] = []
+    for code, strat, legs in groups:
+        if state["placed"] >= cap or n_open + state["entered"] >= MAX_OPEN_STRUCTURES:
+            journal.append("- caps reached; remaining signals skipped")
+            break
+        if code in open_unders:
+            continue                    # one structure per underlying
+        if by_strategy.get(strat, 0) >= MAX_PER_STRATEGY_PER_DAY:
+            journal.append(f"- skip {code} {strat}: strategy cap "
+                           f"({MAX_PER_STRATEGY_PER_DAY}/night) -- diversity")
+            continue
+        ev = legs.iloc[0]["ev_per_share"]
+        if pd.notna(ev) and float(ev) < MIN_EV_PER_SHARE:
+            journal.append(f"- skip {code} {strat}: EV {float(ev):.02f}/sh below "
+                           f"friction floor {MIN_EV_PER_SHARE}")
+            continue
+        if EXPECTED_LEGS.get(strat) is not None and len(legs) != EXPECTED_LEGS[strat]:
+            journal.append(f"- skip {code} {strat}: {len(legs)} legs in signals, "
+                           f"expected {EXPECTED_LEGS[strat]} (partial row-set)")
+            continue
+        sid = f"{today}-{code}-{strat}".replace(" ", "_")
+        if sid in existing_ids:
+            continue                    # same-day re-entry after a close: skip
+        existing_ids.add(sid)
+        if try_enter(code, strat, legs, sid) == "aborted":
+            aborted_tonight.append((code, strat, legs, sid))
+
+    # one same-session retry for rate-limit/transient aborts: the throttle has
+    # cleared the 30s window by now, and RIVN/IONQ-class candidates used to
+    # die twice and never execute
+    for code, strat, legs, sid in aborted_tonight:
+        if state["placed"] >= cap or n_open + state["entered"] >= MAX_OPEN_STRUCTURES:
+            break
+        if code in open_unders:
+            continue
+        if by_strategy.get(strat, 0) >= MAX_PER_STRATEGY_PER_DAY:
+            continue                # the diversity cap binds retries too
+        rsid = sid + "-r1"
+        if rsid in existing_ids:
+            continue
+        existing_ids.add(rsid)
+        journal.append(f"- RETRY {code} {strat} (one shot)")
+        try_enter(code, strat, legs, rsid)
+
+    if state["entered"] == 0:
         journal.append("- no new structures entered")
-    return entered
+    return state["entered"]
 
 
 def _pick_hedge_spread(spot: float, puts, budget: float) -> dict | None:
@@ -652,6 +768,90 @@ def manage_hedge(broker, structs: list[dict], today: str, journal: list[str]) ->
         f"~${pick['payoff']['10%']:,.0f} at -10%, ~${pick['payoff']['15%']:,.0f} at -15%")
 
 
+def orphan_check(broker, structs: list[dict], journal: list[str]) -> None:
+    """Broker->ledger direction: any held option position that belongs to NO
+    open structure is invisible to every other check (reconcile iterates ledger
+    codes only). Journal it loudly and flatten it -- an untracked leg has no
+    exit rule watching it."""
+    try:
+        bqty, pos = _broker_qty(broker)
+    except Exception as e:  # noqa: BLE001
+        journal.append(f"- orphan check skipped: {e}")
+        return
+    known = {l["code"] for s in structs if s["status"] in ("OPEN", "CLOSING", "PENDING_ENTRY")
+             for l in s["legs"]}
+    # OPTION legs only: US.XXX<yymmdd>[C|P]<strike>. A substring heuristic would
+    # match stock tickers like US.COST and try to flatten a SHARE position.
+    import re
+    opt_pat = re.compile(r"\d{6}[CP]\d+$")
+    orphans = [c for c in bqty if c not in known and opt_pat.search(c)]
+    for c in orphans:
+        qty = bqty[c]
+        side = "SELL" if qty > 0 else "BUY"
+        snap = _live_snapshot([c])
+        px = None
+        if snap is not None and c in snap.index:
+            row = snap.loc[c]
+            px = float(row["bid_price"]) if side == "SELL" else float(row["ask_price"])
+        if px and px > 0:
+            broker.place_limit(c, abs(qty), side, round(px, 2), note="ORPHAN flatten")
+            journal.append(f"- ORPHAN {c}: qty {qty} in no structure -- flattening at crossing")
+        else:
+            journal.append(f"- ORPHAN {c}: qty {qty} in no structure -- NO QUOTE, flatten manually")
+    if orphans:
+        try:
+            from scripts._alert import alert
+            alert("Paper book ORPHAN legs", f"{len(orphans)} untracked position(s): "
+                  f"{', '.join(orphans[:6])}", priority="high")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def post_close_sweep(broker, structs: list[dict], today: str, journal: list[str]) -> None:
+    """Runs AFTER the US close (16:05 ET, same session): tonight's day orders
+    are dead, so any partially-filled structure is now a fact, not a
+    work-in-progress. Cancel leftover entry orders, flatten filled legs in the
+    SAME session -- the CVX/SCHW class used to carry a lone leg 24h (72h over
+    a weekend) before the next night's lifecycle sync noticed."""
+    bqty, _ = _broker_qty(broker)
+    # belt-and-braces: cancel any still-listed entry orders for tonight's
+    # partial/unfilled structures before judging them (the market IS closed --
+    # the guard in main enforces that -- but a listed order costs a cancel)
+    try:
+        from moomoo import OrderStatus
+        oo = broker.orders(status_filter_list=[
+            OrderStatus.SUBMITTED, OrderStatus.WAITING_SUBMIT, OrderStatus.SUBMITTING])
+    except Exception:  # noqa: BLE001
+        oo = None
+    order_ids: dict[str, list[str]] = {}
+    if oo is not None and len(oo):
+        for _, o in oo.iterrows():
+            order_ids.setdefault(str(o["code"]), []).append(str(o["order_id"]))
+    for s in structs:
+        if s.get("entry_date") != today or s["status"] != "OPEN" or s.get("kind") == "HEDGE":
+            continue
+        held = [l for l in s["legs"] if abs(bqty.get(l["code"], 0.0)) > 0]
+        if len(held) == len(s["legs"]):
+            continue                              # fully filled: a real position
+        for l in s["legs"]:                       # kill lingering entry orders first
+            if abs(bqty.get(l["code"], 0.0)) == 0:
+                for oid in order_ids.get(l["code"], []):
+                    broker.cancel_order(oid)
+        if not held:
+            s["status"] = "CANCELLED_UNFILLED"
+            s["exit_reason"] = "day orders expired unfilled (post-close sweep)"
+            s["exit_date"] = today
+            journal.append(f"- SWEEP {s['underlying']} {s['strategy']}: nothing filled -> CANCELLED_UNFILLED")
+            continue
+        s["status"] = "CLOSING"
+        s["exit_reason"] = "partial fill at close -- flattening same session"
+        s["exit_date"] = today
+        snap = _live_snapshot([l["code"] for l in held])
+        _close_legs(broker, s, held, s["exit_reason"], bqty, snap)
+        journal.append(f"- SWEEP {s['underlying']} {s['strategy']}: {len(held)}/{len(s['legs'])} "
+                       f"legs filled -> flattening now (no overnight lone legs)")
+
+
 def main() -> None:
     from app.brokers.paper_broker import PaperBroker
 
@@ -674,6 +874,39 @@ def main() -> None:
         acc = broker.account()
         equity = float(acc.iloc[0]["total_assets"]) if "total_assets" in acc.columns else None
 
+        if "--sweep" in sys.argv:
+            # post-close mode: partial-fill repair + orphan check only -- no
+            # entries, no exits (those ran at 23:40). HARD time gate: judging
+            # "day orders are dead" while the market is open would cancel and
+            # flatten the run's own still-working entries (and 04:05 SGT is
+            # BEFORE the close all winter -- EST moves the close to 05:00 SGT).
+            import zoneinfo
+            now_et = dt.datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+            if now_et.strftime("%H:%M") < "16:01" and now_et.date().isoformat() == today:
+                print(f"sweep refused: US market not closed yet ({now_et:%H:%M} ET)")
+                broker.close()
+                return
+            journal.append("## Post-close sweep")
+            post_close_sweep(broker, structs, today, journal)
+            orphan_check(broker, structs, journal)
+            _save_structures(structs)
+            (PAPER_DIR / f"sweep_{today}.done").write_text(
+                dt.datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+            note = JOURNAL_DIR / f"{today}.md"
+            if note.exists():
+                note.write_text(note.read_text(encoding="utf-8")
+                                + "\n\n## Post-close sweep\n" + "\n".join(journal[1:] or ["- clean"])
+                                + "\n", encoding="utf-8")
+            try:
+                from scripts.build_dashboard import build, write_marks
+                write_marks(broker)
+                build()
+            except Exception as e:  # noqa: BLE001
+                print(f"sweep dashboard refresh failed: {e}")
+            print(f"{today}: post-close sweep done")
+            broker.close()
+            return
+
         # 1. hygiene: cancel stale unfilled orders (failed-fill datapoints).
         # Runs FIRST so lifecycle/exits can re-place fresh orders after it.
         journal.append("## Order hygiene")
@@ -683,12 +916,21 @@ def main() -> None:
                 OrderStatus.SUBMITTED, OrderStatus.WAITING_SUBMIT, OrderStatus.SUBMITTING])
             stale = open_orders[open_orders.get("create_time", "").astype(str).str[:10] < today] \
                 if not open_orders.empty else open_orders
+            # never cancel a CLOSING structure's working EXIT order here: that
+            # cancel belongs to sync_lifecycle, paired atomically with its
+            # re-place (a kill between blanket-cancel and re-place used to
+            # leave held legs with no exit order at all)
+            closing_codes = {l["code"] for s in structs
+                             if s["status"] == "CLOSING" for l in s["legs"]}
             n_cancel = 0
             if not stale.empty:
                 for _, o in stale.iterrows():
+                    if str(o["code"]) in closing_codes:
+                        continue
                     if broker.cancel_order(str(o["order_id"])):
                         n_cancel += 1
-            journal.append(f"- cancelled {n_cancel} stale unfilled order(s)")
+            journal.append(f"- cancelled {n_cancel} stale unfilled ENTRY order(s) "
+                           f"(exit orders left to lifecycle sync)")
         except Exception as e:  # noqa: BLE001
             journal.append(f"- hygiene skipped ({e})")
 
@@ -712,14 +954,40 @@ def main() -> None:
         journal.append("\n## Entry-fill chase")
         journal += chase_entry_fills(broker, structs, today)
 
-        # 5. entries (EV-ranked, per-day capped, leg-validated)
+        # 5. entries (EV-ranked, per-day capped, leg-validated) -- unless halted.
+        # HALT file = manual kill switch; daily-loss breach = automatic one.
+        # Both degrade to management-only: exits/hygiene/hedge ran above and
+        # always will; only NEW risk is refused. Guard fails OPEN to "skip
+        # entries", never to "skip exits".
         journal.append("\n## Entries")
-        placed = do_entries(broker, structs, journal, sig_path, budget, today, max_new)
+        halt_reason = None
+        if HALT_FILE.exists():
+            halt_reason = "HALT file present (manual kill switch)"
+        else:
+            try:
+                eq_csv = pd.read_csv(PAPER_DIR / "equity.csv")
+                if len(eq_csv) >= 2:
+                    prev, last = float(eq_csv["equity"].iloc[-2]), float(eq_csv["equity"].iloc[-1])
+                    day_pct = (last - prev) / prev * 100
+                    if day_pct <= -DAILY_LOSS_HALT_PCT:
+                        halt_reason = f"daily loss {day_pct:.1f}% breaches -{DAILY_LOSS_HALT_PCT}%"
+            except Exception:  # noqa: BLE001 - unreadable equity file must not block entries
+                pass
+        if halt_reason:
+            journal.append(f"- ENTRIES SKIPPED: {halt_reason}")
+            try:
+                from scripts._alert import alert
+                alert("Paper pipeline HALTED entries", f"{today}: {halt_reason}", priority="urgent")
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            placed = do_entries(broker, structs, journal, sig_path, budget, today, max_new)
         _save_structures(structs)
 
         # 5. reconciliation: broker truth beats our order records
         journal.append("\n## Reconciliation (broker truth)")
         journal += reconcile(broker, structs)
+        orphan_check(broker, structs, journal)   # broker->ledger direction
         _save_structures(structs)
     except Exception as e:  # noqa: BLE001
         import traceback
@@ -766,17 +1034,22 @@ def main() -> None:
     print(f"{today}: {placed} entered, {len(closing)} closing, {n_open_now} open -> {note}")
     if broker is not None:
         broker.close()
-    sys.stdout.flush()
-    import os
-    os._exit(exit_code)   # ALWAYS hard-exit: moomoo threads must never hang the task
+    return exit_code
 
 
 if __name__ == "__main__":
     from scripts._lock import single_instance
+    rc = 0
     with single_instance("paper_trade") as got:
         if got:
-            main()
+            rc = main() or 0
         else:
             # two concurrent paper_trade processes would DOUBLE-PLACE entries
             # (sid dedup is per-process); the backstop yields to the live run
             print("another paper_trade instance holds the lock -- exiting (work is being done)")
+    # hard-exit AFTER the lock is released: moomoo SDK non-daemon threads
+    # (quote/trade contexts) otherwise hang the process until the runner's
+    # timeout kills it -- and an os._exit inside the lock scope leaks the lock
+    sys.stdout.flush()
+    import os
+    os._exit(rc)

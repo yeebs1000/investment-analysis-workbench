@@ -13,6 +13,7 @@ import datetime as dt
 import html
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -31,9 +32,36 @@ POS_DIM, NEG_DIM = "#0d3a2c", "#43202b"
 
 
 def load_jsonl(p: Path) -> list[dict]:
+    """Tolerant read: one corrupt line (crash mid-append, OneDrive conflict)
+    must cost one record, not the whole ledger."""
     if not p.exists():
         return []
-    return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    out, bad = [], 0
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            bad += 1
+    if bad:
+        print(f"load_jsonl: skipped {bad} undecodable line(s) in {p.name}", flush=True)
+    return out
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """tmp + os.replace with a short retry for OneDrive locks."""
+    import time
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    for attempt in range(3):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(1)
 
 
 def area_chart(dates: list[str], ys: list[float], ref: float | None,
@@ -331,7 +359,7 @@ def write_marks(broker) -> None:
             out[s["id"]] = {"pnl": round(pnl, 0), "entry": round(ne, 2), "mark": round(nm, 2)}
             total += pnl
         out["_total_open_pnl"] = round(total, 0)
-        (PAPER / "marks.json").write_text(json.dumps(out), encoding="utf-8")
+        _atomic_write(PAPER / "marks.json", json.dumps(out))
     except Exception:  # noqa: BLE001
         pass
 
@@ -347,7 +375,11 @@ def snapshot_equity(equity: float, cash: float) -> None:
     df = pd.read_csv(eq_path) if eq_path.exists() else pd.DataFrame(columns=["date", "equity", "cash"])
     df = df[df["date"] != today]
     df = pd.concat([df, pd.DataFrame([{"date": today, "equity": equity, "cash": cash}])])
-    df.to_csv(eq_path, index=False)
+    # atomic: this is a FULL rewrite of the equity history -- a kill mid-write
+    # used to truncate every prior day's row
+    tmp = eq_path.with_suffix(".csv.tmp")
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, eq_path)
 
 
 _DARK = f"""

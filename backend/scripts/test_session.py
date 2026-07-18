@@ -41,6 +41,14 @@ def demo() -> None:
     # naive datetimes are accepted (interpreted as local time)
     assert isinstance(session_date(dt.datetime(2026, 7, 16, 23, 40)), str)
 
+    # holidays: Labor Day Monday is NOT a trading session; the Tuesday after is
+    from scripts._session import holiday_horizon_days, is_trading_session
+    assert not is_trading_session(dt.datetime(2026, 9, 7, 22, 30, tzinfo=SGT))
+    assert is_trading_session(dt.datetime(2026, 9, 8, 22, 30, tzinfo=SGT))
+    # weekend still blocks regardless of holiday list
+    assert not is_trading_session(dt.datetime(2026, 7, 18, 22, 30, tzinfo=SGT))
+    assert holiday_horizon_days(dt.datetime(2026, 7, 18, tzinfo=SGT)) > 300
+
     print("session_date: all checks passed")
 
 
