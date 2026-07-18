@@ -177,7 +177,8 @@ def build() -> Path:
     ordered = sorted(open_s, key=lambda s: (spnl(s) if spnl(s) is not None else -1e12), reverse=True) \
         if have_marks else sorted(open_s, key=lambda s: s["entry_date"], reverse=True)
     mx_pnl = max((abs(spnl(s)) for s in open_s if spnl(s) is not None), default=0.0)
-    today = dt.date.today()
+    from scripts._session import session_date
+    today = dt.date.fromisoformat(session_date())   # DTE vs the ET session, not local SGT
     rows_open = ""
     for s in ordered:
         m = marks.get(s["id"], {})
@@ -336,10 +337,13 @@ def write_marks(broker) -> None:
 
 
 def snapshot_equity(equity: float, cash: float) -> None:
-    """Append today's equity row (idempotent per day, last write wins)."""
+    """Append today's equity row (idempotent per SESSION, last write wins).
+    Keyed to the ET session date so a post-midnight (SGT) backstop updates
+    tonight's row instead of minting a bogus next-day row."""
     import pandas as pd
+    from scripts._session import session_date
     eq_path = PAPER / "equity.csv"
-    today = dt.date.today().isoformat()
+    today = session_date()
     df = pd.read_csv(eq_path) if eq_path.exists() else pd.DataFrame(columns=["date", "equity", "cash"])
     df = df[df["date"] != today]
     df = pd.concat([df, pd.DataFrame([{"date": today, "equity": equity, "cash": cash}])])

@@ -135,8 +135,9 @@ def _record_one(service, code: str, out_dir: Path, today: str) -> None:
 def main() -> None:
     import time
     from app.services.analysis_service import service
+    from scripts._session import session_date
 
-    today = dt.date.today().isoformat()
+    today = session_date()   # ET session date, so a post-midnight retry appends to tonight's dir
     out_dir = CHAINS_DIR / today
     out_dir.mkdir(parents=True, exist_ok=True)
     codes = load_watchlist()
@@ -163,10 +164,15 @@ def main() -> None:
     missing = [c for c in codes if c not in {p.stem for p in out_dir.glob('*.parquet')}]
     print(f"done: {ok} recorded this run, {len(missing)} missing "
           f"({', '.join(missing) if missing else 'none'}) -> {out_dir}", flush=True)
-    # Moomoo SDK leaves non-daemon threads; exit hard like the backtest CLI does.
-    sys.stdout.flush()
-    os._exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    from scripts._lock import single_instance
+    with single_instance("record_chains") as got:
+        if got:
+            main()
+        else:
+            print("another record_chains instance holds the lock -- exiting (work is being done)")
+    # Moomoo SDK leaves non-daemon threads; exit hard AFTER the lock released.
+    sys.stdout.flush()
+    os._exit(0)

@@ -164,4 +164,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from scripts._lock import single_instance
+    with single_instance("log_signals") as got:
+        if got:
+            main()
+        else:
+            print("another log_signals instance holds the lock -- exiting")

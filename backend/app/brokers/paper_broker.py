@@ -194,6 +194,7 @@ class PaperBroker:
                "acc_id": self.acc_id, "order_id": order_id, "action": "MODIFY",
                "new_price": round(price, 2), "new_qty": qty, "note": note, "status": "MODIFY_INTENT"}
         self._ledger(rec)
+        self._throttle_order()          # modify_order shares the high-frequency cap family
         ret, data = self._trade.modify_order(
             ModifyOrderOp.NORMAL, order_id, qty, round(price, 2),
             trd_env=PAPER_ENV, acc_id=self.acc_id)
@@ -208,6 +209,7 @@ class PaperBroker:
             from moomoo import ModifyOrderOp
         except ImportError:  # pragma: no cover
             from futu import ModifyOrderOp
+        self._throttle_order()          # cancels ride the same modify_order cap
         ret, data = self._trade.modify_order(
             ModifyOrderOp.CANCEL, order_id, 0, 0,
             trd_env=PAPER_ENV, acc_id=self.acc_id)

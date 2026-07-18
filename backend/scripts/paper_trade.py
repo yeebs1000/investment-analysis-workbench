@@ -33,6 +33,7 @@ import pandas as pd
 # check and the signal prefilter cannot drift apart -- they were duplicated
 # constants with a "keep them in lockstep" comment, which is how drift starts.
 from scripts.log_signals import MIN_OI as MIN_LEG_OI, leg_tradeable  # noqa: E402
+from scripts._session import session_date  # noqa: E402
 MAX_NEW_PER_DAY = 8
 MAX_OPEN_STRUCTURES = 30
 
@@ -307,7 +308,7 @@ def reconcile(broker, structs: list[dict]) -> list[str]:
         pos = broker.positions()
     except Exception as e:  # noqa: BLE001
         return [f"- reconcile skipped: {e}"]
-    today = dt.date.today().isoformat()
+    today = session_date()
     cost = {str(p["code"]): float(p["cost_price"]) for _, p in pos.iterrows()}
     bqty = {str(p["code"]): float(p["qty"]) for _, p in pos.iterrows() if abs(p["qty"]) > 0}
     lqty: dict[str, float] = {}
@@ -658,7 +659,7 @@ def main() -> None:
     if "--budget" in sys.argv:
         budget = float(sys.argv[sys.argv.index("--budget") + 1])
     max_new = int(sys.argv[sys.argv.index("--max-new") + 1]) if "--max-new" in sys.argv else None
-    today = dt.date.today().isoformat()
+    today = session_date()      # ET session date: a post-midnight (SGT) retry stays on tonight's session
     sig_path = SIGNALS_DIR / f"{today}.csv"
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
     structs = _load_structures()
@@ -771,4 +772,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from scripts._lock import single_instance
+    with single_instance("paper_trade") as got:
+        if got:
+            main()
+        else:
+            # two concurrent paper_trade processes would DOUBLE-PLACE entries
+            # (sid dedup is per-process); the backstop yields to the live run
+            print("another paper_trade instance holds the lock -- exiting (work is being done)")
