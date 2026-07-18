@@ -59,6 +59,24 @@ PAPER_DIR = BACKEND / "data_store" / "paper"
 JOURNAL_DIR = BACKEND / "data_store" / "journal"
 STRUCT_LEDGER = PAPER_DIR / "structures.jsonl"
 
+# --- tail hedge overlay (weekly review 2026-07-18) ---------------------------
+# The book is ~all long-delta bullish structures with NO protection on the
+# standing positions; the 200-SMA regime gate only reshapes FUTURE entries, and
+# it hasn't engaged (SPY ~8% above its 200-SMA). This overlay holds a balanced
+# SPY put debit spread as portfolio insurance: long ~5.5% OTM, short ~12% OTM
+# (caps payoff, finances carry), ~45 DTE, rolled at 21 DTE, sized to a monthly
+# carry budget. Defined risk (long strike above short), so never a naked short.
+# manage_hedge() owns it; check_exits skips kind=="HEDGE" so the premium-harvest
+# rules can't profit-take the insurance away before the crash it's there for.
+HEDGE_ENABLED = True
+HEDGE_UNDER = "US.SPY"
+HEDGE_LONG_OTM = 0.055        # long put strike ~5.5% below spot
+HEDGE_SHORT_OTM = 0.12        # short put strike ~12% below spot
+HEDGE_TARGET_DTE = 45
+HEDGE_ROLL_DTE = 21           # roll when the active hedge decays to this
+HEDGE_MONTHLY_BUDGET = 1200.0 # ~0.4% of a 300k book; bounds the carry per roll
+HEDGE_MAX_CONTRACTS = 15
+
 
 def _load_structures() -> list[dict]:
     if not STRUCT_LEDGER.exists():
@@ -224,6 +242,8 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
     for s in structs:
         if s["status"] != "OPEN":
             continue
+        if s.get("kind") == "HEDGE":
+            continue    # insurance: manage_hedge rolls it; premium-exit rules must not touch it
         # only manage structures whose every leg is actually held (fresh
         # entries may still be filling; phantom ones were handled by lifecycle)
         if not all(abs(bqty.get(l["code"], 0.0)) > 0 for l in s["legs"]):
@@ -382,6 +402,7 @@ def do_entries(broker, structs, journal, sig_path, budget, today, max_new=None) 
     existing_ids = {s["id"] for s in structs}
     placed = 0 if session_reset else sum(
         1 for s in structs if s.get("entry_date") == today
+        and s.get("kind") != "HEDGE"      # the hedge has its own budget; never a per-day entry slot
         and s["status"] not in ("CANCELLED_UNFILLED", "ABORTED_ENTRY"))
     if not sig_path.exists():
         journal.append(f"- no signal file for {today} (market holiday or recorder gap)")
@@ -478,6 +499,158 @@ def do_entries(broker, structs, journal, sig_path, budget, today, max_new=None) 
     return entered
 
 
+def _pick_hedge_spread(spot: float, puts, budget: float) -> dict | None:
+    """Pure selection + sizing for the SPY put debit spread. `puts` is a DataFrame
+    with strike/bid/ask (and optional code). Returns the chosen legs, contract
+    count, cost and modeled drawdown payoffs, or None if no sane spread exists.
+    Kept pure (no I/O) so test_hedge can exercise it."""
+    if puts is None or len(puts) == 0:
+        return None
+    p = puts.copy()
+    p = p[(p["bid"] > 0) & (p["ask"] >= p["bid"])]
+    if p.empty:
+        return None
+    p["mid"] = (p["bid"] + p["ask"]) / 2.0
+    long_leg = p.iloc[(p["strike"] - spot * (1 - HEDGE_LONG_OTM)).abs().argmin()]
+    short_leg = p.iloc[(p["strike"] - spot * (1 - HEDGE_SHORT_OTM)).abs().argmin()]
+    if short_leg["strike"] >= long_leg["strike"]:
+        return None                       # need a real width: short strictly below long
+    net_debit = float(long_leg["mid"] - short_leg["mid"])
+    if net_debit <= 0:                    # degenerate/inverted quotes
+        return None
+    width = float(long_leg["strike"] - short_leg["strike"])
+    n = max(1, min(int(budget // (net_debit * CONTRACT_SIZE)) or 1, HEDGE_MAX_CONTRACTS))
+
+    def payoff(drop: float) -> float:
+        s2 = spot * (1 - drop)
+        intrinsic = min(width, max(0.0, float(long_leg["strike"]) - s2))
+        return round((intrinsic - net_debit) * CONTRACT_SIZE * n, 0)
+
+    return {
+        "long_strike": float(long_leg["strike"]), "short_strike": float(short_leg["strike"]),
+        "long_code": str(long_leg.get("code", "")), "short_code": str(short_leg.get("code", "")),
+        "long_mid": round(float(long_leg["mid"]), 2), "short_mid": round(float(short_leg["mid"]), 2),
+        "net_debit": round(net_debit, 2), "width": width, "contracts": n,
+        "cost": round(net_debit * CONTRACT_SIZE * n, 2),
+        "payoff": {"10%": payoff(0.10), "15%": payoff(0.15), "20%": payoff(0.20)},
+    }
+
+
+def _spy_otm_puts(expiry: str, spot: float):
+    """Live OTM put quotes for the hedge band. The offline recorder keeps only
+    near-money strikes, so this needs OpenD. Returns a DataFrame or None."""
+    import pandas as pd
+    from app.services.analysis_service import service
+    try:
+        with service._lock:
+            chain = service._client.get_option_chain(HEDGE_UNDER, expiry, expiry)
+        chain = chain.copy()
+        chain["strike"] = pd.to_numeric(chain["strike_price"], errors="coerce")
+        puts = chain[chain["option_type"].astype(str).str.upper().str.contains("PUT")]
+        lo, hi = spot * (1 - HEDGE_SHORT_OTM - 0.03), spot * (1 - HEDGE_LONG_OTM + 0.03)
+        band = puts[(puts["strike"] >= lo) & (puts["strike"] <= hi)]
+        if band.empty:
+            return None
+        with service._lock:
+            snap = service._client.get_snapshot(band["code"].tolist()).set_index("code")
+        rows = []
+        for _, r in band.iterrows():
+            c = r["code"]
+            if c not in snap.index:
+                continue
+            s = snap.loc[c]
+            rows.append({"code": c, "strike": float(r["strike"]),
+                         "bid": float(s.get("bid_price") or 0), "ask": float(s.get("ask_price") or 0),
+                         "delta": float(s.get("option_delta") or 0),
+                         "oi": float(s.get("option_open_interest") or 0)})
+        return pd.DataFrame(rows) if rows else None
+    except Exception as e:  # noqa: BLE001
+        print(f"  hedge chain fetch failed: {e}", flush=True)
+        return None
+
+
+def manage_hedge(broker, structs: list[dict], today: str, journal: list[str]) -> None:
+    """Hold or roll the SPY tail-hedge put spread. Runs each session before entries."""
+    if not HEDGE_ENABLED:
+        return
+    today_d = dt.date.fromisoformat(today)
+    active = [s for s in structs if s.get("kind") == "HEDGE" and s["status"] in ("OPEN", "CLOSING")]
+
+    live = []
+    for s in active:
+        try:
+            dleft = (dt.date.fromisoformat(s["expiry"]) - today_d).days
+        except Exception:  # noqa: BLE001
+            dleft = None
+        if s["status"] == "OPEN" and dleft is not None and dleft <= HEDGE_ROLL_DTE:
+            bqty, _ = _broker_qty(broker)
+            snap = _live_snapshot([l["code"] for l in s["legs"]])
+            _close_legs(broker, s, s["legs"], f"hedge roll (DTE {dleft})", bqty, snap)
+            s["status"] = "CLOSING"
+            journal.append(f"- HEDGE roll: closing {s['id']} (DTE {dleft} <= {HEDGE_ROLL_DTE})")
+        elif s["status"] == "OPEN":
+            live.append((s, dleft))
+
+    if live:
+        s, dleft = live[0]
+        journal.append(f"- HEDGE active: {s['id']} DTE {dleft}, holding")
+        return
+
+    try:
+        from app.services.analysis_service import service
+        with service._lock:
+            snap0 = service._client.get_snapshot([HEDGE_UNDER])
+        spot = float(snap0.iloc[0]["last_price"])
+        picked = service._pick_option_expiry(HEDGE_UNDER, HEDGE_TARGET_DTE)
+    except Exception as e:  # noqa: BLE001
+        journal.append(f"- HEDGE skipped: SPY spot/expiry fetch failed ({e})")
+        return
+    if not spot or picked is None:
+        journal.append("- HEDGE skipped: no SPY spot/expiry")
+        return
+    _, expiry, dte, _ = picked
+    pick = _pick_hedge_spread(spot, _spy_otm_puts(expiry, spot), HEDGE_MONTHLY_BUDGET)
+    if pick is None:
+        journal.append("- HEDGE skipped: no tradeable OTM put spread found")
+        return
+
+    sid = f"{today}-HEDGE-SPY"
+    if any(s["id"] == sid for s in structs):
+        journal.append("- HEDGE already placed today; skipping")
+        return
+    n = pick["contracts"]
+    legs_spec = [("BUY", pick["long_strike"], pick["long_code"], pick["long_mid"]),
+                 ("SELL", pick["short_strike"], pick["short_code"], pick["short_mid"])]
+    leg_recs, rejected = [], False
+    for side, strike, code, mid in legs_spec:
+        res = broker.place_limit(code, n, side, mid, note=f"HEDGE {sid}")
+        if res.get("status") == "REJECTED":
+            rejected = True
+        leg_recs.append({"code": code, "side": side, "qty": n, "right": "PUT",
+                         "strike": strike, "entry_mid": round(mid, 2),
+                         "order_status": res.get("status"), "order_id": res.get("order_id")})
+    rec = {
+        "id": sid, "underlying": HEDGE_UNDER, "strategy": "SPY Tail Hedge", "kind": "HEDGE",
+        "status": "OPEN", "entry_date": today, "expiry": str(expiry), "dte": int(dte),
+        "net_debit_credit": -pick["net_debit"], "max_loss": pick["net_debit"],
+        "max_profit": round(pick["width"] - pick["net_debit"], 2),
+        "contracts": n, "capital": pick["cost"], "legs": leg_recs,
+    }
+    if rejected:
+        for lr in leg_recs:
+            if lr.get("order_id") and lr.get("order_status") == "SUBMITTED":
+                broker.cancel_order(lr["order_id"])
+        rec["status"] = "ABORTED_ENTRY"; rec["capital"] = 0.0
+        structs.append(rec)
+        journal.append("- HEDGE abort: a leg rejected; siblings cancelled")
+        return
+    structs.append(rec)
+    journal.append(
+        f"- HEDGE placed: {n}x SPY {pick['long_strike']:.0f}/{pick['short_strike']:.0f}p "
+        f"@ ${pick['net_debit']:.2f} (cost ${pick['cost']:.0f}), DTE {dte} | pays "
+        f"~${pick['payoff']['10%']:,.0f} at -10%, ~${pick['payoff']['15%']:,.0f} at -15%")
+
+
 def main() -> None:
     from app.brokers.paper_broker import PaperBroker
 
@@ -527,6 +700,11 @@ def main() -> None:
         # 3. rule-based exits
         journal.append("\n## Exits")
         journal += check_exits(broker, structs, today) or ["- none"]
+        _save_structures(structs)
+
+        # 3b. tail hedge overlay: hold/roll SPY put spread (check_exits skips it)
+        journal.append("\n## Tail hedge")
+        manage_hedge(broker, structs, today, journal)
         _save_structures(structs)
 
         # 4. chase yesterday-and-today's resting entry legs toward fill (modify)
