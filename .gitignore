@@ -38,3 +38,19 @@ docs/backtest-report*
 docs/*.pdf
 backtest-report*.pdf
 _yeebs_launch.ps1
+
+# --- Private overlay: notifications, quant research, strategy validation, ---
+# --- competition, and the unattended supervisor. NEVER public. These live ---
+# --- on disk (the local system uses them) but are not part of the public  ---
+# --- Investment Analysis Workbench.                                        ---
+backend/scripts/_alert.py
+backend/scripts/telegram_setup.py
+backend/scripts/test_alert.py
+backend/scripts/research_queue.py
+backend/scripts/experiments/
+backend/scripts/competition_scan.py
+backend/scripts/nightly_runner.py
+backend/scripts/opend_probe.py
+backend/scripts/analysis/
+docs/RUNNING.md
+docs/options-strategy-tuning.md

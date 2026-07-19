@@ -24,12 +24,11 @@ and tells you what the numbers already say.
 The one exception to read-only is an optional **paper-trading loop**,
 hard-locked to Moomoo's SIMULATE environment by construction (see the
 guardrails header in `backend/app/brokers/paper_broker.py`) — it cannot touch
-real money. Backtests, parameter sweeps, the analysis/review suite, and the
-daily recorder → signal-log → paper-trade loop are documented in
-[`docs/RUNNING.md`](docs/RUNNING.md). All personal data (bar caches, chain
-archives, signal logs, trades, journals, result reports) stays in the
-gitignored `backend/data_store/` and never leaves your machine — the repo
-carries the base version only.
+real money. The daily recorder → signal-log → paper-trade scripts live in
+`backend/scripts/`; each script's module docstring documents its flags. All
+personal data (bar caches, chain archives, signal logs, trades, journals,
+result reports) stays in the gitignored `backend/data_store/` and never leaves
+your machine — the repo carries the base version only.
 
 ## Why this is different
 
