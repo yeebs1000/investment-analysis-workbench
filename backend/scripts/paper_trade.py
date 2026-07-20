@@ -858,6 +858,17 @@ def main() -> None:
     budget = None
     if "--budget" in sys.argv:
         budget = float(sys.argv[sys.argv.index("--budget") + 1])
+    else:
+        # SCHEDULED runs never passed --budget, so size_structure fell back to
+        # 1-lot-no-cap mode and the 1%-risk / 15%-capital caps were silently
+        # NOT enforced (maiden night entered a $48k CSP = 16% of book on one
+        # name). Default the budget from baseline.json so unattended nights
+        # trade under the same policy as manual ones.
+        try:
+            base = json.loads((PAPER_DIR / "baseline.json").read_text(encoding="utf-8"))
+            budget = float(base.get("working_budget_usd")) or None
+        except Exception:  # noqa: BLE001 - no baseline -> legacy 1-lot mode
+            budget = None
     max_new = int(sys.argv[sys.argv.index("--max-new") + 1]) if "--max-new" in sys.argv else None
     today = session_date()      # ET session date: a post-midnight (SGT) retry stays on tonight's session
     sig_path = SIGNALS_DIR / f"{today}.csv"
