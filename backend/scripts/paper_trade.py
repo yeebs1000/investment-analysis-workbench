@@ -76,6 +76,30 @@ PAPER_DIR = BACKEND / "data_store" / "paper"
 JOURNAL_DIR = BACKEND / "data_store" / "journal"
 STRUCT_LEDGER = PAPER_DIR / "structures.jsonl"
 
+# Manual-override exit channel (human-in-the-loop). Write
+# data_store/paper/flagged_exits.json = {"<structure_id>": "<condition>"}:
+#   "close"           -> close at the next session unconditionally
+#   "close_if_profit" -> close only when marked P&L > 0 (holds otherwise)
+#   "close_if_loss"   -> close only when marked P&L < 0
+# check_exits evaluates flags before the rule-based exits and prunes a flag
+# once its structure is no longer OPEN. Lets the owner retire an out-of-policy
+# legacy position (e.g. an oversized CSP) without editing code.
+FLAGGED_EXITS = PAPER_DIR / "flagged_exits.json"
+
+
+def _load_flags() -> dict:
+    try:
+        return json.loads(FLAGGED_EXITS.read_text(encoding="utf-8")) if FLAGGED_EXITS.exists() else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_flags(flags: dict) -> None:
+    tmp = FLAGGED_EXITS.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(flags, indent=1), encoding="utf-8")
+    import os
+    os.replace(tmp, FLAGGED_EXITS)
+
 # --- tail hedge overlay (weekly review 2026-07-18) ---------------------------
 # The book is ~all long-delta bullish structures with NO protection on the
 # standing positions; the 200-SMA regime gate only reshapes FUTURE entries, and
@@ -296,6 +320,8 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
         for _, p in pos.iterrows():
             by_code[str(p["code"])] = p
 
+    flags = _load_flags()
+
     for s in structs:
         if s["status"] != "OPEN":
             continue
@@ -328,21 +354,33 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
                 s["peak_pnl"] = round(pnl, 3)
         peak = s.get("peak_pnl")
         reason = None
-        if dte_left <= exit_dte:
-            reason = f"DTE {dte_left} <= {exit_dte}"
-        elif marks_ok and rule.profit_target is not None and base and base > 0 \
-                and pnl >= rule.profit_target * base:
-            reason = f"profit target ({pnl:+.2f} >= {rule.profit_target:.0%} of {base:.2f})"
-        elif marks_ok and trail_base and peak is not None \
-                and peak >= TRAIL_ARM * trail_base \
-                and pnl <= peak * (1 - TRAIL_GIVEBACK):
-            reason = (f"trailing high-water stop (peak {peak:+.2f}, now {pnl:+.2f}, "
-                      f"gave back >{TRAIL_GIVEBACK:.0%})")
-        elif marks_ok and rule.stop_to_be is not None and base and base > 0:
-            if pnl >= rule.stop_to_be * base:
-                s["be_armed"] = True
-            elif s.get("be_armed") and pnl <= 0:
-                reason = "breakeven stop (winner faded)"
+        # manual override flags take precedence over the rule-based exits
+        flag = flags.get(s["id"])
+        if flag == "close":
+            reason = "manual flag: close"
+        elif flag == "close_if_profit" and marks_ok and pnl > 0:
+            reason = f"manual flag: close_if_profit ({pnl:+.2f}/sh in profit)"
+        elif flag == "close_if_loss" and marks_ok and pnl < 0:
+            reason = f"manual flag: close_if_loss ({pnl:+.2f}/sh)"
+        elif flag:
+            lines.append(f"- HOLD {s['underlying']} {s['strategy']}: flag '{flag}' "
+                         f"not met (marked P&L {pnl:+.2f}/sh)")
+        if reason is None:                       # no manual flag fired -> rule-based exits
+            if dte_left <= exit_dte:
+                reason = f"DTE {dte_left} <= {exit_dte}"
+            elif marks_ok and rule.profit_target is not None and base and base > 0 \
+                    and pnl >= rule.profit_target * base:
+                reason = f"profit target ({pnl:+.2f} >= {rule.profit_target:.0%} of {base:.2f})"
+            elif marks_ok and trail_base and peak is not None \
+                    and peak >= TRAIL_ARM * trail_base \
+                    and pnl <= peak * (1 - TRAIL_GIVEBACK):
+                reason = (f"trailing high-water stop (peak {peak:+.2f}, now {pnl:+.2f}, "
+                          f"gave back >{TRAIL_GIVEBACK:.0%})")
+            elif marks_ok and rule.stop_to_be is not None and base and base > 0:
+                if pnl >= rule.stop_to_be * base:
+                    s["be_armed"] = True
+                elif s.get("be_armed") and pnl <= 0:
+                    reason = "breakeven stop (winner faded)"
         if reason is None:
             continue
         snap = _live_snapshot([l["code"] for l in s["legs"]])
@@ -351,6 +389,13 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
         s["exit_reason"] = reason
         s["exit_date"] = today
         lines.append(f"- EXIT {s['underlying']} {s['strategy']}: {reason} (marked P&L {pnl:+.2f}/sh)")
+
+    # prune flags whose structure is no longer OPEN (satisfied or gone)
+    if flags:
+        open_ids = {s["id"] for s in structs if s["status"] == "OPEN"}
+        live = {k: v for k, v in flags.items() if k in open_ids}
+        if live != flags:
+            _save_flags(live)
     return lines
 
 

@@ -127,7 +127,32 @@ def demo() -> None:
     pt.post_close_sweep(FakeBroker(), [s2], today, [])
     assert s2["status"] == "CANCELLED_UNFILLED"
 
-    print("paper_flow: strategy cap, EV floor, retry, write-ahead, adoption, sweep -- all pass")
+    # ---- manual-flag exits: close_if_profit closes only when green ------
+    pt._save_flags = lambda f: None                 # no disk writes in the test
+    csp_leg = {"code": "US.AMAT260918P480000", "side": "SELL", "qty": 1, "entry_mid": 3.0}
+    base_csp = {"id": "F1", "underlying": "US.AMAT", "strategy": "Cash-Secured Put",
+                "status": "OPEN", "entry_date": today, "expiry": "2026-09-18",
+                "max_profit": 3.0, "net_debit_credit": 3.0, "legs": [csp_leg]}
+
+    def run_flag(mark, flag):
+        pt._load_flags = lambda: {"F1": flag}
+        pos = pd.DataFrame([{"code": csp_leg["code"], "qty": -1.0, "nominal_price": mark}])
+        b = FakeBroker(positions=pos)
+        s = dict(base_csp); s["legs"] = [dict(csp_leg)]
+        pt.check_exits(b, [s], today)
+        return s["status"], b.placed
+
+    # short at 3.0, now 2.0 -> +1.0/sh profit -> close_if_profit CLOSES it
+    st, placed = run_flag(2.0, "close_if_profit")
+    assert st == "CLOSING" and placed, f"profit flag should close: {st}"
+    # short at 3.0, now 4.0 -> -1.0/sh loss -> close_if_profit HOLDS
+    st, placed = run_flag(4.0, "close_if_profit")
+    assert st == "OPEN" and not placed, f"loss flag should hold: {st}"
+    # unconditional close fires regardless of P&L
+    st, _ = run_flag(4.0, "close")
+    assert st == "CLOSING", f"unconditional close should fire: {st}"
+
+    print("paper_flow: strategy cap, EV floor, retry, write-ahead, adoption, sweep, flags -- all pass")
 
 
 if __name__ == "__main__":
