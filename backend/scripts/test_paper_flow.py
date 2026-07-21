@@ -4,6 +4,7 @@ post-close sweep. All offline -- a FakeBroker stands in for OpenD.
 
 Run: PYTHONPATH=. .venv/Scripts/python.exe scripts/test_paper_flow.py
 """
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -151,6 +152,31 @@ def demo() -> None:
     # unconditional close fires regardless of P&L
     st, _ = run_flag(4.0, "close")
     assert st == "CLOSING", f"unconditional close should fire: {st}"
+
+    # ---- undefined-risk hard stop: CSP stopped at -25% of capital; a
+    #      defined-risk spread at the SAME % loss is NOT stopped ------------
+    pt._load_flags = lambda: {}
+    csp = {"id": "S1", "underlying": "US.X", "strategy": "Cash-Secured Put",
+           "status": "OPEN", "entry_date": today, "expiry": "2026-09-18",
+           "max_profit": 3.0, "net_debit_credit": 3.0, "contracts": 1,
+           "capital": 4000.0, "legs": [{"code": "US.X260918P100000", "side": "SELL",
+                                        "qty": 1, "entry_mid": 3.0}]}
+    # short put now worth 13.0 -> -10.0/sh -> -$1000 = -25% of $4000 -> STOP
+    b = FakeBroker(positions=pd.DataFrame([{"code": csp["legs"][0]["code"], "qty": -1.0,
+                                            "nominal_price": 13.0}]))
+    s = json.loads(json.dumps(csp)); pt.check_exits(b, [s], today)
+    assert s["status"] == "CLOSING" and "stop loss" in s.get("exit_reason", ""), s.get("exit_reason")
+    # a Call Debit Spread down the SAME 25% of capital is NOT stopped (defined risk)
+    cds = {"id": "S2", "underlying": "US.Y", "strategy": "Call Debit Spread",
+           "status": "OPEN", "entry_date": today, "expiry": "2026-09-18",
+           "max_profit": 5.0, "net_debit_credit": -5.0, "contracts": 1, "capital": 500.0,
+           "legs": [{"code": "US.Y260918C100000", "side": "BUY", "qty": 1, "entry_mid": 5.0},
+                    {"code": "US.Y260918C105000", "side": "SELL", "qty": 1, "entry_mid": 0.0}]}
+    b = FakeBroker(positions=pd.DataFrame([
+        {"code": "US.Y260918C100000", "qty": 1.0, "nominal_price": 3.75},   # long down $1.25
+        {"code": "US.Y260918C105000", "qty": -1.0, "nominal_price": 0.0}]))  # -$125 = -25% of $500
+    s = json.loads(json.dumps(cds)); pt.check_exits(b, [s], today)
+    assert s["status"] == "OPEN", f"defined-risk spread must NOT hard-stop: {s.get('exit_reason')}"
 
     print("paper_flow: strategy cap, EV floor, retry, write-ahead, adoption, sweep, flags -- all pass")
 

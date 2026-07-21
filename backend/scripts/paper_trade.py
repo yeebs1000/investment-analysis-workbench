@@ -71,6 +71,15 @@ EXIT_DTE_ALL_LONG = 2         # all-long structures (straddles) have no assignme
                               # the exit grid showed time-stops cost them ~4pts -- ride to near expiry
 CONTRACT_SIZE = 100
 
+# Hard stop-loss on UNDEFINED / large-collateral positions only (short puts,
+# covered calls): they can bleed a big loss the longer they're held, which is
+# the risk a "hold if red" flag would otherwise leave open. DEFINED-RISK
+# structures (debit/credit spreads, straddles) are already loss-capped at their
+# debit/width, so a percentage stop there just churns them out on a normal
+# drawdown -- they keep the validated hold-to-management rules instead.
+UNDEFINED_RISK_STOP = {"Cash-Secured Put", "Covered Call"}
+UNDEFINED_STOP_PCT = 0.25     # close at a marked loss >= 25% of posted capital
+
 SIGNALS_DIR = BACKEND / "data_store" / "signals"
 PAPER_DIR = BACKEND / "data_store" / "paper"
 JOURNAL_DIR = BACKEND / "data_store" / "journal"
@@ -366,8 +375,14 @@ def check_exits(broker, structs: list[dict], today: str) -> list[str]:
             lines.append(f"- HOLD {s['underlying']} {s['strategy']}: flag '{flag}' "
                          f"not met (marked P&L {pnl:+.2f}/sh)")
         if reason is None:                       # no manual flag fired -> rule-based exits
+            cap = s.get("capital") or 0
+            pnl_usd = pnl * CONTRACT_SIZE * s.get("contracts", 1)
             if dte_left <= exit_dte:
                 reason = f"DTE {dte_left} <= {exit_dte}"
+            elif marks_ok and s["strategy"] in UNDEFINED_RISK_STOP and cap \
+                    and pnl_usd <= -UNDEFINED_STOP_PCT * cap:
+                reason = (f"stop loss ({pnl_usd:+,.0f} <= -{UNDEFINED_STOP_PCT:.0%} "
+                          f"of ${cap:,.0f} capital)")
             elif marks_ok and rule.profit_target is not None and base and base > 0 \
                     and pnl >= rule.profit_target * base:
                 reason = f"profit target ({pnl:+.2f} >= {rule.profit_target:.0%} of {base:.2f})"
